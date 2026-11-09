@@ -1,4 +1,4 @@
-# ScreenConfig-Final.ps1
+﻿# ScreenConfig-Final.ps1
 $ErrorActionPreference = 'Stop'
 
 # ========== CHARGEMENT DES ASSEMBLIES WPF ==========
@@ -7,7 +7,12 @@ Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 
 # ========== INTÉGRATION DE DisplayApi ==========
-If (-not ([System.Management.Automation.PSTypeName]'DisplayApi').Type) {
+$displayApiType = ([System.Management.Automation.PSTypeName]'DisplayApi').Type
+If ($displayApiType -and -not $displayApiType.GetField('Version')) {
+    # Un type déjà compilé ne peut pas être remplacé dans la même session PowerShell
+    throw "Une ancienne version de DisplayApi est déjà chargée dans cette session PowerShell. Fermez-la puis relancez le script."
+}
+If (-not $displayApiType) {
     Add-Type -Language CSharp -TypeDefinition @"
 using System;
 using System.Collections.Generic;
@@ -18,6 +23,8 @@ public struct POINTL { public int x; public int y; }
 
 public static class DisplayApi
 {
+    public const int Version = 2;
+
     [StructLayout(LayoutKind.Sequential)]
     public struct LUID { public uint LowPart; public int HighPart; }
 
@@ -92,6 +99,35 @@ public static class DisplayApi
         }
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DISPLAYCONFIG_DEVICE_INFO_HEADER {
+        public uint type;
+        public uint size;
+        public LUID adapterId;
+        public uint id;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+        public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string viewGdiDeviceName;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DISPLAYCONFIG_TARGET_DEVICE_NAME {
+        public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+        public uint flags;
+        public uint outputTechnology;
+        public ushort edidManufactureId;
+        public ushort edidProductCodeId;
+        public uint connectorInstance;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string monitorFriendlyDeviceName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string monitorDevicePath;
+    }
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
     public struct DEVMODE
     {
@@ -154,6 +190,12 @@ public static class DisplayApi
     public static extern int SetDisplayConfig(uint numPathArrayElements, DISPLAYCONFIG_PATH_INFO[] pathArray,
                                               uint numModeInfoArrayElements, DISPLAYCONFIG_MODE_INFO[] modeInfoArray, uint flags);
 
+    [DllImport("user32.dll")]
+    static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_SOURCE_DEVICE_NAME requestPacket);
+
+    [DllImport("user32.dll")]
+    static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_TARGET_DEVICE_NAME requestPacket);
+
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     static extern bool EnumDisplaySettingsEx(string lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode, int dwFlags);
 
@@ -166,18 +208,27 @@ public static class DisplayApi
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     static extern bool EnumDisplayDevices(string lpDevice, int iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, int dwFlags);
 
+    [DllImport("user32.dll")]
+    static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
     const uint QDC_ONLY_ACTIVE_PATHS              = 0x00000002;
     const uint SDC_APPLY                          = 0x00000080;
     const uint SDC_USE_SUPPLIED_DISPLAY_CONFIG    = 0x00000020;
     const uint SDC_NO_OPTIMIZATION                = 0x00000100;
     const uint SDC_SAVE_TO_DATABASE               = 0x00000200;
     const uint DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE = 1;
+    const uint DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1;
+    const uint DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME = 2;
 
     const int ENUM_CURRENT_SETTINGS = -1;
     const int DM_POSITION           = 0x00000020;
     const int CDS_UPDATEREGISTRY    = 0x00000001;
     const int CDS_NORESET           = 0x10000000;
     const int CDS_SET_PRIMARY       = 0x00000010;
+    const int DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001;
+
+    const uint SWP_NOZORDER   = 0x0004;
+    const uint SWP_NOACTIVATE = 0x0010;
 
     private static int lastResult = 0;
     public static int LastResult { get { return lastResult; } }
@@ -188,6 +239,19 @@ public static class DisplayApi
         public int Width, Height;
         public int X, Y;
         public LUID Adapter;
+
+        // Identifiant unique (carte graphique + source), stable entre deux appels
+        public string Key = "";
+        // Moniteur relié à la source
+        public uint TargetId;
+        public string GdiDeviceName = "";
+        public string FriendlyName = "";
+        public string DevicePath = "";
+        public string PnpId = "";
+        public EdidInfo Edid;
+
+        // Windows place toujours l'écran principal à l'origine du bureau
+        public bool IsPrimary { get { return X == 0 && Y == 0; } }
     }
 
     public class EdidInfo
@@ -202,6 +266,63 @@ public static class DisplayApi
         public int ManufactureWeek = 0;
         public int ManufactureYear = 0;
         public string RegistryPath = "";
+    }
+
+    static string MakeKey(LUID adapter, uint id)
+    {
+        return adapter.HighPart.ToString("X8") + adapter.LowPart.ToString("X8") + ":" + id.ToString();
+    }
+
+    static bool SameAdapter(LUID a, LUID b)
+    {
+        return a.LowPart == b.LowPart && a.HighPart == b.HighPart;
+    }
+
+    static void FillMonitorInfo(SourceInfo info, DISPLAYCONFIG_PATH_INFO[] paths, uint pathCount)
+    {
+        try
+        {
+            var src = new DISPLAYCONFIG_SOURCE_DEVICE_NAME();
+            src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            src.header.size = (uint)Marshal.SizeOf(typeof(DISPLAYCONFIG_SOURCE_DEVICE_NAME));
+            src.header.adapterId = info.Adapter;
+            src.header.id = info.Id;
+            if (DisplayConfigGetDeviceInfo(ref src) == 0)
+                info.GdiDeviceName = src.viewGdiDeviceName ?? "";
+
+            for (int p = 0; p < pathCount && p < paths.Length; p++)
+            {
+                var si = paths[p].sourceInfo;
+                if (si.id != info.Id || !SameAdapter(si.adapterId, info.Adapter)) continue;
+
+                var ti = paths[p].targetInfo;
+                info.TargetId = ti.id;
+
+                var tgt = new DISPLAYCONFIG_TARGET_DEVICE_NAME();
+                tgt.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+                tgt.header.size = (uint)Marshal.SizeOf(typeof(DISPLAYCONFIG_TARGET_DEVICE_NAME));
+                tgt.header.adapterId = ti.adapterId;
+                tgt.header.id = ti.id;
+                if (DisplayConfigGetDeviceInfo(ref tgt) == 0)
+                {
+                    info.FriendlyName = (tgt.monitorFriendlyDeviceName ?? "").Trim();
+                    info.DevicePath = tgt.monitorDevicePath ?? "";
+
+                    // \\?\DISPLAY#DEL40A1#5&10a58edf&0&UID4352#{guid} -> Enum\DISPLAY\DEL40A1\5&10a58edf&0&UID4352
+                    string[] parts = info.DevicePath.Split('#');
+                    if (parts.Length >= 3)
+                    {
+                        info.PnpId = parts[1];
+                        info.Edid = ReadEdid(@"SYSTEM\CurrentControlSet\Enum\DISPLAY\" + parts[1] + @"\" + parts[2] + @"\Device Parameters");
+                    }
+                }
+                break;
+            }
+        }
+        catch
+        {
+            // Informations facultatives : la géométrie reste exploitable
+        }
     }
 
     public static List<SourceInfo> GetSources()
@@ -226,14 +347,22 @@ public static class DisplayApi
                 info.X = sm.position.x;
                 info.Y = sm.position.y;
                 info.Adapter = modes[i].adapterId;
+                info.Key = MakeKey(modes[i].adapterId, modes[i].id);
+                FillMonitorInfo(info, paths, pathCount);
                 list.Add(info);
             }
         }
-        list.Sort((a,b) => a.Id.CompareTo(b.Id));
+        list.Sort((a, b) => {
+            int c = a.Id.CompareTo(b.Id);
+            if (c != 0) return c;
+            c = a.Adapter.HighPart.CompareTo(b.Adapter.HighPart);
+            if (c != 0) return c;
+            return a.Adapter.LowPart.CompareTo(b.Adapter.LowPart);
+        });
         return list;
     }
 
-    public static bool ApplyPositions(Dictionary<UInt32, POINTL> positions)
+    static bool ApplyCore(Dictionary<UInt32, POINTL> positionsById, Dictionary<string, POINTL> positionsByKey)
     {
         uint pathCount, modeCount;
         if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, out pathCount, out modeCount) != 0) { lastResult = -1; return false; }
@@ -245,11 +374,16 @@ public static class DisplayApi
         {
             if (modes[i].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
             {
-                uint id = modes[i].id;
-                if (positions != null && positions.ContainsKey(id))
+                POINTL dest = new POINTL();
+                bool found = false;
+                if (positionsByKey != null)
+                    found = positionsByKey.TryGetValue(MakeKey(modes[i].adapterId, modes[i].id), out dest);
+                else if (positionsById != null)
+                    found = positionsById.TryGetValue(modes[i].id, out dest);
+
+                if (found)
                 {
                     var sm = modes[i].modeInfo.sourceMode;
-                    POINTL dest = positions[id];
                     sm.position.x = dest.x;
                     sm.position.y = dest.y;
                     modes[i].modeInfo.sourceMode = sm;
@@ -263,66 +397,115 @@ public static class DisplayApi
         return (r == 0);
     }
 
+    public static bool ApplyPositions(Dictionary<UInt32, POINTL> positions)
+    {
+        return ApplyCore(positions, null);
+    }
+
+    // Même chose qu'ApplyPositions, mais sans ambiguïté quand plusieurs cartes graphiques ont des sources de même Id
+    public static bool ApplyPositionsByKey(Dictionary<string, POINTL> positions)
+    {
+        return ApplyCore(null, positions);
+    }
+
     public static bool TrySetPrimaryByPosition(int x, int y)
     {
-        int devNum = 0;
-        while (true)
+        var devices = new List<string>();
+        string target = null;
+        for (int devNum = 0; ; devNum++)
         {
             DISPLAY_DEVICE dd = new DISPLAY_DEVICE();
             dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
             if (!EnumDisplayDevices(null, devNum, ref dd, 0))
                 break;
 
-            bool isDisplay = dd.DeviceName != null && dd.DeviceName.StartsWith(@"\.\DISPLAY", StringComparison.OrdinalIgnoreCase);
-            if (!isDisplay) { devNum++; continue; }
+            bool isDisplay = dd.DeviceName != null && dd.DeviceName.StartsWith(@"\\.\DISPLAY", StringComparison.OrdinalIgnoreCase);
+            if (!isDisplay || (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) == 0) continue;
 
             DEVMODE dm = new DEVMODE();
             dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
-            if (!EnumDisplaySettingsEx(dd.DeviceName, ENUM_CURRENT_SETTINGS, ref dm, 0)) { devNum++; continue; }
+            if (!EnumDisplaySettingsEx(dd.DeviceName, ENUM_CURRENT_SETTINGS, ref dm, 0)) continue;
 
+            devices.Add(dd.DeviceName);
             if (dm.dmPosition.x == x && dm.dmPosition.y == y)
-            {
-                int r1 = ChangeDisplaySettingsEx(dd.DeviceName, IntPtr.Zero, IntPtr.Zero, (uint)(CDS_SET_PRIMARY | CDS_UPDATEREGISTRY | CDS_NORESET), IntPtr.Zero);
-                int r2 = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
-                return (r1 == 0 && r2 == 0);
-            }
-            devNum++;
+                target = dd.DeviceName;
         }
-        return false;
+        if (target == null) { lastResult = -3; return false; }
+
+        // L'écran principal doit être en (0,0) : tous les écrans sont décalés de (-x, -y)
+        foreach (string name in devices)
+        {
+            DEVMODE dm = new DEVMODE();
+            dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+            if (!EnumDisplaySettingsEx(name, ENUM_CURRENT_SETTINGS, ref dm, 0)) continue;
+            dm.dmPosition.x -= x;
+            dm.dmPosition.y -= y;
+            dm.dmFields = DM_POSITION;
+
+            uint flags = (uint)(CDS_UPDATEREGISTRY | CDS_NORESET);
+            if (name == target) flags |= (uint)CDS_SET_PRIMARY;
+            int r1 = ChangeDisplaySettingsEx(name, ref dm, IntPtr.Zero, flags, IntPtr.Zero);
+            if (r1 != 0) { lastResult = r1; return false; }
+        }
+        int r2 = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+        lastResult = r2;
+        return (r2 == 0);
+    }
+
+    // Positionne une fenêtre en coordonnées écran du processus (même repère que System.Windows.Forms.Screen)
+    public static bool MoveWindow(IntPtr hwnd, int x, int y, int width, int height)
+    {
+        return SetWindowPos(hwnd, IntPtr.Zero, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
     public static EdidInfo ReadEdid(string regPath)
     {
         try
         {
-            RegistryKey key = Registry.LocalMachine.OpenSubKey(regPath);
-            if (key == null) return null;
-
-            byte[] edid = (byte[])key.GetValue("EDID", null);
-            if (edid == null || edid.Length < 128) return null;
-
-            EdidInfo info = new EdidInfo();
-            info.RegistryPath = regPath;
-
-            info.VendorId = "" + (char)(((edid[8] & 0x7C) / 4) + 64)
-                                 + (char)(((edid[8] & 0x03) * 32) + ((edid[9] & 0xE0) / 32) + 64)
-                                 + (char)((edid[9] & 0x1F) + 64);
-
-            info.ProductId = ((edid[11] << 8) + edid[10]).ToString("X4");
-            info.ManufactureWeek = edid[16];
-            info.ManufactureYear = edid[17] + 1990;
-
-            info.WidthMm = edid[21] * 10;
-            info.HeightMm = edid[22] * 10;
-
-            if (info.WidthMm > 0 && info.HeightMm > 0)
+            using (RegistryKey key = Registry.LocalMachine.OpenSubKey(regPath))
             {
-                double w = info.WidthMm / 25.4;
-                double h = info.HeightMm / 25.4;
-                info.DiagonalInches = Math.Sqrt(w * w + h * h);
-            }
+                if (key == null) return null;
 
-            return info;
+                byte[] edid = (byte[])key.GetValue("EDID", null);
+                if (edid == null || edid.Length < 128) return null;
+
+                EdidInfo info = new EdidInfo();
+                info.RegistryPath = regPath;
+
+                info.VendorId = "" + (char)(((edid[8] & 0x7C) / 4) + 64)
+                                     + (char)(((edid[8] & 0x03) * 32) + ((edid[9] & 0xE0) / 32) + 64)
+                                     + (char)((edid[9] & 0x1F) + 64);
+
+                info.ProductId = ((edid[11] << 8) + edid[10]).ToString("X4");
+                info.ManufactureWeek = edid[16];
+                info.ManufactureYear = edid[17] + 1990;
+
+                info.WidthMm = edid[21] * 10;
+                info.HeightMm = edid[22] * 10;
+
+                if (info.WidthMm > 0 && info.HeightMm > 0)
+                {
+                    double w = info.WidthMm / 25.4;
+                    double h = info.HeightMm / 25.4;
+                    info.DiagonalInches = Math.Sqrt(w * w + h * h);
+                }
+
+                // Descripteurs texte : 0xFC = nom du modèle, 0xFF = numéro de série
+                for (int d = 54; d + 18 <= 126; d += 18)
+                {
+                    if (edid[d] != 0 || edid[d + 1] != 0 || edid[d + 2] != 0) continue;
+                    byte tag = edid[d + 3];
+                    if (tag != 0xFC && tag != 0xFF) continue;
+                    string text = System.Text.Encoding.ASCII.GetString(edid, d + 5, 13);
+                    int nl = text.IndexOf('\n');
+                    if (nl >= 0) text = text.Substring(0, nl);
+                    text = text.Trim();
+                    if (text.Length == 0) continue;
+                    if (tag == 0xFC) info.Model = text; else info.Serial = text;
+                }
+
+                return info;
+            }
         }
         catch
         {
@@ -351,9 +534,10 @@ Function Wait-ExtendedDesktop {
 }
 
 Function New-PointLDictionary {
+    param([type]$KeyType = [System.UInt32])
     $pointType = [DisplayApi].Assembly.GetType('POINTL')
     if (-not $pointType) { throw "POINTL type not found." }
-    $dictType = [System.Collections.Generic.Dictionary``2].MakeGenericType([System.UInt32], $pointType)
+    $dictType = [System.Collections.Generic.Dictionary``2].MakeGenericType($KeyType, $pointType)
     return [Activator]::CreateInstance($dictType)
 }
 
@@ -365,6 +549,62 @@ Function New-PointL {
     return $p
 }
 
+# Renvoie les sources physiques affectées à chaque emplacement du layout (SourceMap[emplacement] = index de source)
+Function Resolve-SlotSources {
+    param(
+        $Sources,
+        [int[]]$SourceMap,
+        [int]$SlotCount
+    )
+
+    if (-not $SourceMap -or $SourceMap.Count -lt $SlotCount) { throw "Invalid SourceMap: $SlotCount entries expected." }
+    $seen = @{}
+    $result = @()
+    for ($i = 0; $i -lt $SlotCount; $i++) {
+        $idx = $SourceMap[$i]
+        if ($idx -lt 0 -or $idx -ge $Sources.Count) { throw "Screen $($idx + 1) not found ($($Sources.Count) screen(s) detected)." }
+        if ($seen.ContainsKey($idx)) { throw "Screen $($idx + 1) is used twice in the layout." }
+        $seen[$idx] = $true
+        $result += $Sources[$idx]
+    }
+    return $result
+}
+
+# Place les écrans non prévus par le layout, puis décale tout pour mettre l'écran principal en (0,0)
+Function Complete-LayoutPositions {
+    param(
+        $Positions,
+        $Sources,
+        [int]$PrimaryIndex
+    )
+
+    if ($PrimaryIndex -lt 0 -or $PrimaryIndex -ge $Sources.Count) { throw "Primary index $PrimaryIndex out of range." }
+
+    # Écrans en trop (4e et suivants) : à la suite, collés au bord droit de la disposition
+    foreach ($src in $Sources) {
+        if ($Positions.Contains($src.Key)) { continue }
+        $anchor = $null
+        $right = [int]::MinValue
+        foreach ($placed in $Sources) {
+            if (-not $Positions.Contains($placed.Key)) { continue }
+            $edge = $Positions[$placed.Key][0] + $placed.Width
+            if ($edge -gt $right) { $right = $edge; $anchor = $placed }
+        }
+        $Positions[$src.Key] = @($right, $Positions[$anchor.Key][1])
+    }
+
+    # SetDisplayConfig fait de l'écran situé en (0,0) l'écran principal
+    $origin = $Positions[$Sources[$PrimaryIndex].Key]
+    $dx = $origin[0]; $dy = $origin[1]
+
+    $result = New-PointLDictionary -KeyType ([string])
+    foreach ($key in @($Positions.Keys)) {
+        $p = $Positions[$key]
+        $result.Add($key, (New-PointL -X ($p[0] - $dx) -Y ($p[1] - $dy)))
+    }
+    return $result
+}
+
 Function Apply-LayoutPositions {
     param(
         $Positions,
@@ -373,7 +613,10 @@ Function Apply-LayoutPositions {
         [string]$LayoutName
     )
 
-    $ok = [DisplayApi]::ApplyPositions($Positions)
+    $script:LastLayoutWarning = $null
+
+    $final = Complete-LayoutPositions -Positions $Positions -Sources $Sources -PrimaryIndex $PrimaryIndex
+    $ok = [DisplayApi]::ApplyPositionsByKey($final)
     if (-not $ok) {
         Write-Warning "SetDisplayConfig returned code: $([DisplayApi]::LastResult)"
         return $false
@@ -381,9 +624,10 @@ Function Apply-LayoutPositions {
     Write-Host "$LayoutName layout applied." -ForegroundColor Green
 
     $primary = $Sources[$PrimaryIndex]
-    $ptPrimary = $Positions[[uint32]$primary.Id]
-    if (-not [DisplayApi]::TrySetPrimaryByPosition($ptPrimary.x, $ptPrimary.y)) {
-        Write-Warning "Could not set primary display (GPO restriction?)."
+    $current = [DisplayApi]::GetSources() | Where-Object { $_.Key -eq $primary.Key } | Select-Object -First 1
+    if ($current -and -not $current.IsPrimary -and -not [DisplayApi]::TrySetPrimaryByPosition($current.X, $current.Y)) {
+        $script:LastLayoutWarning = "Could not set primary display (code $([DisplayApi]::LastResult))."
+        Write-Warning $script:LastLayoutWarning
     } else {
         Write-Host "Primary set to screen index $PrimaryIndex (ID $($primary.Id))." -ForegroundColor Green
     }
@@ -392,21 +636,26 @@ Function Apply-LayoutPositions {
 }
 
 Function Set-LayoutTShape {
-    param([int]$PrimaryIndex = 0)
+    param(
+        [int]$PrimaryIndex = 0,
+        [int[]]$SourceMap = @(1, 2, 0)
+    )
 
     $sources = Wait-ExtendedDesktop -MinScreens 3
     if ($sources.Count -lt 3) { throw "Need at least 3 screens, found $($sources.Count)." }
 
-    $srcA = $sources[0]; $srcB = $sources[1]; $srcC = $sources[2]
+    # Emplacements : 0 = haut gauche, 1 = haut droite, 2 = bas centré
+    $slots = Resolve-SlotSources -Sources $sources -SourceMap $SourceMap -SlotCount 3
+    $srcB = $slots[0]; $srcC = $slots[1]; $srcA = $slots[2]
 
     $topWidth = $srcB.Width + $srcC.Width
     [int]$xA = [Math]::Floor(($topWidth - $srcA.Width) / 2.0)
     [int]$yA = [Math]::Max($srcB.Height, $srcC.Height)
 
-    $positions = New-PointLDictionary
-    $positions.Add([uint32]$srcB.Id, (New-PointL -X 0 -Y 0))
-    $positions.Add([uint32]$srcC.Id, (New-PointL -X $srcB.Width -Y 0))
-    $positions.Add([uint32]$srcA.Id, (New-PointL -X $xA -Y $yA))
+    $positions = [ordered]@{}
+    $positions[$srcB.Key] = @(0, 0)
+    $positions[$srcC.Key] = @($srcB.Width, 0)
+    $positions[$srcA.Key] = @($xA, $yA)
 
     return Apply-LayoutPositions -Positions $positions -Sources $sources -PrimaryIndex $PrimaryIndex -LayoutName "T-shape"
 }
@@ -414,16 +663,27 @@ Function Set-LayoutTShape {
 Function Set-LayoutHorizontal {
     param(
         [int]$MinScreens = 3,
-        [int]$PrimaryIndex = 2
+        [int]$PrimaryIndex = 2,
+        [int[]]$SourceMap = @()
     )
 
     $sources = Wait-ExtendedDesktop -MinScreens $MinScreens
     if ($sources.Count -lt $MinScreens) { throw "Need at least $MinScreens screens, found $($sources.Count)." }
 
-    $positions = New-PointLDictionary
-    $xOffset = 0
+    # Ordre de gauche à droite : écrans du SourceMap, puis les autres dans l'ordre des Id
+    $ordered = @()
+    if ($SourceMap.Count -gt 0) {
+        $ordered += Resolve-SlotSources -Sources $sources -SourceMap $SourceMap -SlotCount $SourceMap.Count
+    }
+    $usedKeys = @($ordered | ForEach-Object { $_.Key })
     foreach ($src in $sources) {
-        $positions.Add([uint32]$src.Id, (New-PointL -X $xOffset -Y 0))
+        if ($usedKeys -notcontains $src.Key) { $ordered += $src }
+    }
+
+    $positions = [ordered]@{}
+    $xOffset = 0
+    foreach ($src in $ordered) {
+        $positions[$src.Key] = @($xOffset, 0)
         $xOffset += $src.Width
     }
 
@@ -431,25 +691,31 @@ Function Set-LayoutHorizontal {
 }
 
 Function Set-LayoutLineOut {
-    param([int]$PrimaryIndex = 0)
+    param(
+        [int]$PrimaryIndex = 0,
+        [int[]]$SourceMap = @(0, 1, 2)
+    )
 
     $sources = Wait-ExtendedDesktop -MinScreens 3
     if ($sources.Count -lt 3) { throw "Need at least 3 screens, found $($sources.Count)." }
 
-    $srcA = $sources[0]; $srcB = $sources[1]; $srcC = $sources[2]
+    # Emplacements : 0 = gauche, 1 = centre, 2 = petit écran à droite aligné en bas
+    $slots = Resolve-SlotSources -Sources $sources -SourceMap $SourceMap -SlotCount 3
+    $srcA = $slots[0]; $srcB = $slots[1]; $srcC = $slots[2]
 
     $mainHeight = [Math]::Max($srcA.Height, $srcB.Height)
     [int]$yC = $mainHeight - $srcC.Height
 
-    $positions = New-PointLDictionary
-    $positions.Add([uint32]$srcA.Id, (New-PointL -X 0 -Y 0))
-    $positions.Add([uint32]$srcB.Id, (New-PointL -X $srcA.Width -Y 0))
-    $positions.Add([uint32]$srcC.Id, (New-PointL -X ($srcA.Width + $srcB.Width) -Y $yC))
+    $positions = [ordered]@{}
+    $positions[$srcA.Key] = @(0, 0)
+    $positions[$srcB.Key] = @($srcA.Width, 0)
+    $positions[$srcC.Key] = @(($srcA.Width + $srcB.Width), $yC)
 
     return Apply-LayoutPositions -Positions $positions -Sources $sources -PrimaryIndex $PrimaryIndex -LayoutName "Line-out"
 }
 
 # ========== DONNÉES DES LAYOUTS ==========
+# SourceMap[i] = index (dans [DisplayApi]::GetSources()) de l'écran placé dans l'emplacement i ; Screens[i].Id = SourceMap[i] + 1
 $script:Layouts = @(
     @{
         Name      = "T-shape"
@@ -479,12 +745,71 @@ $script:Layouts = @(
         Favorite  = $false
         SourceMap = @(0, 1, 2)
         Screens   = @(
-            @{ Id = 1; X = 0;   Y = 0;  W = 140; H = 90; Primary = $false }
+            @{ Id = 1; X = 0;   Y = 0;  W = 140; H = 90; Primary = $true  }
             @{ Id = 2; X = 140; Y = 0;  W = 140; H = 90; Primary = $false }
             @{ Id = 3; X = 310; Y = 30; W = 80;  H = 60; Primary = $false }
         )
     }
 )
+
+# ========== PRÉFÉRENCES (favoris, échanges, écran principal) ==========
+$script:SettingsPath = Join-Path $env:APPDATA "ScreenConfig\settings.json"
+
+Function Save-Settings {
+    Try {
+        $saved = @(ForEach ($layout In $script:Layouts) {
+            $primarySlot = -1
+            For ($i = 0; $i -lt $layout.Screens.Count; $i++) {
+                If ($layout.Screens[$i].Primary) { $primarySlot = $i; break }
+            }
+            @{
+                LayoutKey   = $layout.LayoutKey
+                Favorite    = [bool]$layout.Favorite
+                SourceMap   = @($layout.SourceMap)
+                PrimarySlot = $primarySlot
+            }
+        })
+        $dir = Split-Path -Parent $script:SettingsPath
+        If (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        [System.IO.File]::WriteAllText($script:SettingsPath, (@{ Layouts = $saved } | ConvertTo-Json -Depth 5), [System.Text.Encoding]::UTF8)
+    }
+    Catch {
+        Write-Warning "Préférences non enregistrées : $($_.Exception.Message)"
+    }
+}
+
+Function Import-Settings {
+    If (-not (Test-Path -LiteralPath $script:SettingsPath)) { return }
+    Try {
+        $data = [System.IO.File]::ReadAllText($script:SettingsPath) | ConvertFrom-Json
+        ForEach ($saved In @($data.Layouts)) {
+            $layout = $script:Layouts | Where-Object { $_.LayoutKey -eq $saved.LayoutKey } | Select-Object -First 1
+            If (-not $layout) { continue }
+
+            $layout.Favorite = [bool]$saved.Favorite
+
+            # Le SourceMap enregistré doit être une permutation de celui d'origine
+            $count = $layout.SourceMap.Count
+            $map = @($saved.SourceMap | ForEach-Object { [int]$_ })
+            $expected = (@($layout.SourceMap | Sort-Object) -join ',')
+            If ($map.Count -ne $count -or (@($map | Sort-Object) -join ',') -ne $expected) { continue }
+
+            For ($i = 0; $i -lt $count; $i++) {
+                $layout.SourceMap[$i] = $map[$i]
+                $layout.Screens[$i].Id = $map[$i] + 1
+            }
+            $primarySlot = [int]$saved.PrimarySlot
+            If ($primarySlot -ge 0 -and $primarySlot -lt $count) {
+                For ($i = 0; $i -lt $count; $i++) { $layout.Screens[$i].Primary = ($i -eq $primarySlot) }
+            }
+        }
+    }
+    Catch {
+        Write-Warning "Préférences ignorées : $($_.Exception.Message)"
+    }
+}
+
+Import-Settings
 
 # Index du layout sélectionné (par défaut : le premier favoris)
 $script:SelectedLayoutIndex = 0
@@ -496,6 +821,30 @@ for ($i = 0; $i -lt $script:Layouts.Count; $i++) {
 }
 $script:ShowFavoritesOnly = $false
 $script:SelectedSwapIndex = -1
+$script:LastLayoutWarning = $null
+
+# ========== ÉCRANS CONNECTÉS ==========
+$script:Displays = @()
+
+Function Update-DisplayInfo {
+    Try { $list = [DisplayApi]::GetSources() } Catch { $list = $null }
+    $script:Displays = @(If ($list) { $list })
+}
+
+# Nom + résolution de l'écran d'index $Index (même numérotation que les layouts : Id = index + 1)
+Function Get-DisplayLabel {
+    param([int]$Index)
+
+    If ($Index -lt 0 -or $Index -ge $script:Displays.Count) { return "Non détecté" }
+    $d = $script:Displays[$Index]
+    $name = $d.FriendlyName
+    If (-not $name -and $d.Edid -and $d.Edid.Model -ne "Unknown") { $name = $d.Edid.Model }
+    If (-not $name -and $d.PnpId) { $name = $d.PnpId }
+    If (-not $name) { $name = "Écran" }
+    return "$name`n$($d.Width) × $($d.Height)"
+}
+
+Update-DisplayInfo
 
 # ========== XAML DE L'INTERFACE ==========
 [xml]$xaml = @"
@@ -595,12 +944,18 @@ $window = [System.Windows.Markup.XamlReader]::Load($reader)
 $pnlCards        = $window.FindName("pnlCards")
 $cvPreview       = $window.FindName("cvPreview")
 $btnApply        = $window.FindName("btnApply")
-$btnIdentify     = $window.FindName("btnIdentify")  # <-- AJOUTE CETTE LIGNE
+$btnIdentify     = $window.FindName("btnIdentify")
 $txtStatus       = $window.FindName("txtStatus")
 $txtFavStar      = $window.FindName("txtFavStar")
 $txtPreviewTitle = $window.FindName("txtPreviewTitle")
 
 # ========== FONCTIONS D'AFFICHAGE ==========
+Function Set-Status {
+    param([string]$Text, [string]$Color)
+    $txtStatus.Text = $Text
+    $txtStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString($Color)
+}
+
 Function Swap-ScreenSlots {
     param([int]$IndexA, [int]$IndexB)
     $layout = $script:Layouts[$script:SelectedLayoutIndex]
@@ -627,7 +982,8 @@ Function Draw-ScreenRect {
         [bool]$Primary,
         [bool]$Mini,
         [int]$ScreenId = -1,
-        [int]$ScreenIndex = -1
+        [int]$ScreenIndex = -1,
+        [string]$SubLabel = ""
     )
 
     $isSwapSelected = (-not $Mini -and $ScreenIndex -ge 0 -and $ScreenIndex -eq $script:SelectedSwapIndex)
@@ -664,10 +1020,11 @@ Function Draw-ScreenRect {
             ForEach ($s In $layout.Screens) {
                 $s.Primary = ($s.Id -eq $clickedId)
             }
+            Save-Settings
             Update-Preview
             Build-Cards
         })
-        $ctxMenu.Items.Add($mi)
+        $ctxMenu.Items.Add($mi) | Out-Null
         $rect.ContextMenu = $ctxMenu
 
         $rect.Tag = $ScreenIndex
@@ -677,19 +1034,17 @@ Function Draw-ScreenRect {
             If ($script:SelectedSwapIndex -lt 0) {
                 $script:SelectedSwapIndex = $clickedIdx
                 $selId = $script:Layouts[$script:SelectedLayoutIndex].Screens[$clickedIdx].Id
-                $txtStatus.Text = [string]::Format("Écran {0} sélectionné. Cliquez sur un autre écran pour échanger.", $selId)
-                $txtStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FFD700")
+                Set-Status ([string]::Format("Écran {0} sélectionné. Cliquez sur un autre écran pour échanger.", $selId)) "#FFD700"
                 Update-Preview
             } ElseIf ($script:SelectedSwapIndex -eq $clickedIdx) {
                 $script:SelectedSwapIndex = -1
-                $txtStatus.Text = "Prêt"
-                $txtStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#888888")
+                Set-Status "Prêt" "#888888"
                 Update-Preview
             } Else {
                 Swap-ScreenSlots -IndexA $script:SelectedSwapIndex -IndexB $clickedIdx
                 $script:SelectedSwapIndex = -1
-                $txtStatus.Text = "Écrans échangés."
-                $txtStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#4CAF50")
+                Save-Settings
+                Set-Status "Écrans échangés." "#4CAF50"
                 Update-Preview
                 Build-Cards
             }
@@ -709,13 +1064,31 @@ Function Draw-ScreenRect {
     $tb.VerticalAlignment = "Center"
     $tb.IsHitTestVisible = $false
 
-    $tb.Measure([System.Windows.Size]::new([double]::PositiveInfinity, [double]::PositiveInfinity))
-    $tbW = $tb.DesiredSize.Width
-    $tbH = $tb.DesiredSize.Height
+    # Nom et résolution de l'écran sous le numéro (aperçu principal uniquement)
+    $content = $tb
+    If (-not $Mini -and $SubLabel -and $H -ge 60) {
+        $sub = [System.Windows.Controls.TextBlock]::new()
+        $sub.Text = $SubLabel
+        $sub.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#DDDDDD")
+        $sub.FontSize = 11
+        $sub.TextAlignment = "Center"
+        $sub.HorizontalAlignment = "Center"
+        $sub.TextTrimming = "CharacterEllipsis"
+        $sub.MaxWidth = [Math]::Max($W - 8, 0)
 
-    [System.Windows.Controls.Canvas]::SetLeft($tb, $X + ($W - $tbW) / 2)
-    [System.Windows.Controls.Canvas]::SetTop($tb, $Y + ($H - $tbH) / 2)
-    $Canvas.Children.Add($tb) | Out-Null
+        $content = [System.Windows.Controls.StackPanel]::new()
+        $content.IsHitTestVisible = $false
+        $content.Children.Add($tb) | Out-Null
+        $content.Children.Add($sub) | Out-Null
+    }
+
+    $content.Measure([System.Windows.Size]::new([double]::PositiveInfinity, [double]::PositiveInfinity))
+    $tbW = $content.DesiredSize.Width
+    $tbH = $content.DesiredSize.Height
+
+    [System.Windows.Controls.Canvas]::SetLeft($content, $X + ($W - $tbW) / 2)
+    [System.Windows.Controls.Canvas]::SetTop($content, $Y + ($H - $tbH) / 2)
+    $Canvas.Children.Add($content) | Out-Null
 }
 
 Function Draw-LayoutPreview {
@@ -762,7 +1135,8 @@ Function Draw-LayoutPreview {
         $sy = (($s.Y - $minY) * $scale) + $offsetY
         $sw = $s.W * $scale
         $sh = $s.H * $scale
-        Draw-ScreenRect -Canvas $Canvas -X $sx -Y $sy -W $sw -H $sh -Label "$($s.Id)" -Primary $s.Primary -Mini $Mini -ScreenId $s.Id -ScreenIndex $idx
+        $subLabel = If ($Mini) { "" } Else { Get-DisplayLabel -Index ($s.Id - 1) }
+        Draw-ScreenRect -Canvas $Canvas -X $sx -Y $sy -W $sw -H $sh -Label "$($s.Id)" -Primary $s.Primary -Mini $Mini -ScreenId $s.Id -ScreenIndex $idx -SubLabel $subLabel
     }
 }
 
@@ -810,13 +1184,12 @@ Function Build-Cards {
         $miFav.Add_Click({
             param($sender, $e)
             $layoutIdx = $sender.Tag
-            $wasFavorite = $script:Layouts[$layoutIdx].Favorite
-            ForEach ($l In $script:Layouts) { $l.Favorite = $false }
-            If (-not $wasFavorite) { $script:Layouts[$layoutIdx].Favorite = $true }
+            $script:Layouts[$layoutIdx].Favorite = -not $script:Layouts[$layoutIdx].Favorite
+            Save-Settings
             Build-Cards
             Update-Preview
         })
-        $ctxMenu.Items.Add($miFav)
+        $ctxMenu.Items.Add($miFav) | Out-Null
         $border.ContextMenu = $ctxMenu
 
         $stack = [System.Windows.Controls.StackPanel]::new()
@@ -884,8 +1257,7 @@ Function Update-Preview {
 Function Set-LayoutFromGui {
     $currentLayout = $script:Layouts[$script:SelectedLayoutIndex]
 
-    $txtStatus.Text = "Application en cours..."
-    $txtStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FFD700")
+    Set-Status "Application en cours..." "#FFD700"
 
     # Trouver l'index de l'écran principal dans le layout
     $primaryScreenIdx = 0
@@ -895,33 +1267,144 @@ Function Set-LayoutFromGui {
 
     # Récupérer l'index dans SourceMap pour l'écran principal
     $primarySourceIdx = $currentLayout.SourceMap[$primaryScreenIdx]
+    $sourceMap = [int[]]$currentLayout.SourceMap
 
     Try {
         switch ($currentLayout.LayoutKey) {
             "T" {
-                Set-LayoutTShape -PrimaryIndex $primarySourceIdx
-                $txtStatus.Text = "Configuration T-shape appliquée."
-                $txtStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#4CAF50")
+                $result = Set-LayoutTShape -PrimaryIndex $primarySourceIdx -SourceMap $sourceMap
             }
             "Horizontal" {
-                Set-LayoutHorizontal -MinScreens 3 -PrimaryIndex $primarySourceIdx
-                $txtStatus.Text = "Configuration Full line appliquée."
-                $txtStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#4CAF50")
+                $result = Set-LayoutHorizontal -MinScreens 3 -PrimaryIndex $primarySourceIdx -SourceMap $sourceMap
             }
             "LineOut" {
-                Set-LayoutLineOut -PrimaryIndex $primarySourceIdx
-                $txtStatus.Text = "Configuration Line-out appliquée."
-                $txtStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#4CAF50")
+                $result = Set-LayoutLineOut -PrimaryIndex $primarySourceIdx -SourceMap $sourceMap
             }
             default {
                 throw "Layout non supporté : $($currentLayout.LayoutKey)"
             }
         }
+
+        $applied = @($result)
+        If ($applied.Count -eq 0 -or $applied[-1] -ne $true) {
+            Set-Status "Échec de l'application de $($currentLayout.Name) (code $([DisplayApi]::LastResult))." "#E63946"
+        } ElseIf ($script:LastLayoutWarning) {
+            Set-Status "Configuration $($currentLayout.Name) appliquée, mais l'écran principal n'a pas pu être défini." "#FFA500"
+        } Else {
+            Set-Status "Configuration $($currentLayout.Name) appliquée." "#4CAF50"
+        }
     }
     Catch {
-        $txtStatus.Text = "Erreur: $($_.Exception.Message)"
-        $txtStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#E63946")
+        Set-Status "Erreur: $($_.Exception.Message)" "#E63946"
     }
+
+    Update-DisplayInfo
+    Update-Preview
+}
+
+# ========== FONCTION POUR IDENTIFIER LES ÉCRANS ==========
+$script:IdentifyWindows = @()
+$script:IdentifyTimer = $null
+$script:IdentifySeconds = 4
+
+Function Close-IdentifyOverlays {
+    param([string]$Message)
+
+    If ($script:IdentifyTimer) {
+        $script:IdentifyTimer.Stop()
+        $script:IdentifyTimer = $null
+    }
+    ForEach ($w In $script:IdentifyWindows) { $w.Close() }
+    $script:IdentifyWindows = @()
+    If ($Message) { Set-Status $Message "#4CAF50" }
+}
+
+Function Show-IdentifyOverlays {
+    Close-IdentifyOverlays
+
+    # Numérotation identique à l'aperçu : écran N = source N-1 de [DisplayApi]::GetSources()
+    Update-DisplayInfo
+    Update-Preview
+    If ($script:Displays.Count -eq 0) {
+        Set-Status "Aucun écran détecté." "#E63946"
+        return
+    }
+
+    if (-not ([System.Management.Automation.PSTypeName]'System.Windows.Forms.Screen').Type) {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    }
+    $formsScreens = @([System.Windows.Forms.Screen]::AllScreens)
+
+    For ($i = 0; $i -lt $script:Displays.Count; $i++) {
+        $d = $script:Displays[$i]
+
+        # Rectangle de l'écran dans le repère du processus (tient compte de la mise à l'échelle Windows)
+        $fs = $formsScreens | Where-Object { $_.DeviceName -eq $d.GdiDeviceName } | Select-Object -First 1
+        If ($fs) {
+            $bx = $fs.Bounds.X; $by = $fs.Bounds.Y; $bw = $fs.Bounds.Width; $bh = $fs.Bounds.Height
+        } Else {
+            $bx = $d.X; $by = $d.Y; $bw = $d.Width; $bh = $d.Height
+        }
+
+        $ovl = [System.Windows.Window]::new()
+        $ovl.WindowStyle = [System.Windows.WindowStyle]::None
+        $ovl.AllowsTransparency = $true
+        $ovl.Background = [System.Windows.Media.Brushes]::Transparent
+        $ovl.Topmost = $true
+        $ovl.ShowInTaskbar = $false
+        $ovl.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
+
+        $number = [System.Windows.Controls.TextBlock]::new()
+        $number.Text = ($i + 1).ToString()
+        $number.FontSize = [Math]::Max([Math]::Min($bh / 4, 200), 48)
+        $number.Foreground = [System.Windows.Media.Brushes]::White
+        $number.HorizontalAlignment = "Center"
+        $number.FontWeight = [System.Windows.FontWeights]::Bold
+
+        $name = [System.Windows.Controls.TextBlock]::new()
+        $name.Text = Get-DisplayLabel -Index $i
+        $name.FontSize = 22
+        $name.Foreground = [System.Windows.Media.Brushes]::White
+        $name.HorizontalAlignment = "Center"
+        $name.TextAlignment = "Center"
+
+        $panel = [System.Windows.Controls.StackPanel]::new()
+        $panel.HorizontalAlignment = "Center"
+        $panel.VerticalAlignment = "Center"
+        $panel.Children.Add($number) | Out-Null
+        $panel.Children.Add($name) | Out-Null
+
+        $border = [System.Windows.Controls.Border]::new()
+        $border.Background = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromArgb(180, 0, 0, 0))
+        $border.CornerRadius = [System.Windows.CornerRadius]::new(20)
+        $border.Padding = [System.Windows.Thickness]::new(40)
+        $border.Child = $panel
+
+        $ovl.Content = $border
+
+        # Fermer au clic
+        $ovl.Add_MouseLeftButtonDown({
+            Close-IdentifyOverlays -Message "Identification terminée"
+        })
+
+        # Placement en pixels sur l'écran visé, puis plein écran sur ce même écran
+        $hwnd = [System.Windows.Interop.WindowInteropHelper]::new($ovl).EnsureHandle()
+        [DisplayApi]::MoveWindow($hwnd, $bx, $by, $bw, $bh) | Out-Null
+        $ovl.Show()
+        $ovl.WindowState = [System.Windows.WindowState]::Maximized
+
+        $script:IdentifyWindows += $ovl
+    }
+
+    # Fermer après quelques secondes si non cliqué
+    $script:IdentifyTimer = [System.Windows.Threading.DispatcherTimer]::new()
+    $script:IdentifyTimer.Interval = [System.TimeSpan]::FromSeconds($script:IdentifySeconds)
+    $script:IdentifyTimer.Add_Tick({
+        Close-IdentifyOverlays -Message "Identification terminée (timeout)"
+    })
+    $script:IdentifyTimer.Start()
+
+    Set-Status "Cliquez sur un numéro ou attendez $($script:IdentifySeconds) secondes..." "#FFD700"
 }
 
 # ========== ÉVÉNEMENTS ==========
@@ -930,70 +1413,7 @@ $btnApply.Add_Click({
 })
 
 $btnIdentify.Add_Click({
-    $txtStatus.Text = "Cliquez sur un numéro ou attendez 10 secondes..."
-    $txtStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#FFD700")
-
-    if (-not ([System.Management.Automation.PSTypeName]'System.Windows.Forms.Screen').Type) {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-    }
-
-    $script:identifyWindows = @()
-    $screens = [System.Windows.Forms.Screen]::AllScreens
-
-    foreach ($screen in $screens) {
-        $window = [System.Windows.Window]::new()
-        $window.Width = $screen.Bounds.Width
-        $window.Height = $screen.Bounds.Height
-        $window.Left = $screen.Bounds.Left
-        $window.Top = $screen.Bounds.Top
-        $window.WindowStyle = [System.Windows.WindowStyle]::None
-        $window.AllowsTransparency = $true
-        $window.Background = [System.Windows.Media.Brushes]::Transparent
-        $window.Topmost = $true
-        $window.ShowInTaskbar = $false
-
-        $textBlock = [System.Windows.Controls.TextBlock]::new()
-        $textBlock.Text = ($screens.IndexOf($screen) + 1).ToString()
-        $textBlock.FontSize = [Math]::Min($screen.Bounds.Height / 4, 200)
-        $textBlock.Foreground = [System.Windows.Media.Brushes]::White
-        $textBlock.HorizontalAlignment = "Center"
-        $textBlock.VerticalAlignment = "Center"
-        $textBlock.FontWeight = [System.Windows.FontWeights]::Bold
-
-        $border = [System.Windows.Controls.Border]::new()
-        $border.Background = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromArgb(180, 0, 0, 0))
-        $border.CornerRadius = [System.Windows.CornerRadius]::new(20)
-        $border.Padding = [System.Windows.Thickness]::new(40)
-        $border.Child = $textBlock
-
-        $window.Content = $border
-
-        # Fermer au clic
-        $window.Add_MouseLeftButtonDown({
-            param($sender, $e)
-            foreach ($w in $script:identifyWindows) { $w.Close() }
-            $script:identifyWindows = @()
-            if ($timer) { $timer.Stop() }
-            $txtStatus.Text = "Identification terminée"
-            $txtStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#4CAF50")
-        })
-
-        $window.Show()
-        $script:identifyWindows += $window
-    }
-
-    # Fermer après 4 secondes si non cliqué
-    $script:timer = [System.Windows.Threading.DispatcherTimer]::new()
-    $script:timer.Interval = [System.TimeSpan]::FromSeconds(4)
-    $script:timer.Add_Tick({
-        param($sender, $e)
-        $sender.Stop()
-        foreach ($w in $script:identifyWindows) { $w.Close() }
-        $script:identifyWindows = @()
-        $txtStatus.Text = "Identification terminée (timeout)"
-        $txtStatus.Foreground = [System.Windows.Media.BrushConverter]::new().ConvertFromString("#4CAF50")
-    })
-    $script:timer.Start()
+    Show-IdentifyOverlays
 })
 
 $txtFavStar.Add_MouseLeftButtonDown({
@@ -1016,7 +1436,9 @@ $cvPreview.Add_SizeChanged({
     Update-Preview
 })
 
-# ========== FONCTION POUR IDENTIFIER LES ÉCRANS ==========
+$window.Add_Closed({
+    Close-IdentifyOverlays
+})
 
 # ========== AFFICHER LA FENÊTRE ==========
 $window.ShowDialog() | Out-Null
