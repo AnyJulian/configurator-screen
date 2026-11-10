@@ -703,15 +703,20 @@ public static class DisplayApi
 Function Wait-ExtendedDesktop {
     param(
         [int]$TimeoutSeconds = 10,
-        [int]$MinScreens = 2
+        [int]$MinScreens = 2,
+        # extend = Étendre ; external = Deuxième écran uniquement (la dalle du portable est coupée)
+        [ValidateSet('extend', 'external')]
+        [string]$Mode = 'extend'
     )
-    DisplaySwitch.exe /extend
+    DisplaySwitch.exe "/$Mode"
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
         Start-Sleep -Milliseconds 500
         $sources = [DisplayApi]::GetSources()
-    } while ((-not $sources -or $sources.Count -lt $MinScreens) -and (Get-Date) -lt $deadline)
-    if (-not $sources -or $sources.Count -lt $MinScreens) {
+        $ready = $sources -and $sources.Count -ge $MinScreens -and
+                 ($Mode -ne 'external' -or @($sources | Where-Object { $_.IsInternal }).Count -eq 0)
+    } while (-not $ready -and (Get-Date) -lt $deadline)
+    if (-not $ready) {
         throw "Extended desktop not ready after ${TimeoutSeconds}s. Found $( if ($sources) { $sources.Count } else { 0 } ) source(s)."
     }
     return $sources
@@ -875,6 +880,12 @@ Function Get-LayoutGeometry {
             [int]$yC = $mainHeight - $srcC.Height
             $result = @( @(0, 0), @([int]$srcA.Width, 0), @([int]($srcA.Width + $srcB.Width), $yC) )
         }
+        "Below" {
+            # Emplacements : 0 = grand écran, 1 = écran centré juste en dessous
+            $top = $Slots[0]; $bottom = $Slots[1]
+            [int]$xBottom = [Math]::Floor(($top.Width - $bottom.Width) / 2.0)
+            $result = @( @(0, 0), @($xBottom, [int]$top.Height) )
+        }
         default {
             throw "Unknown layout: $LayoutKey"
         }
@@ -1003,11 +1014,11 @@ Function Invoke-ScreenConfiguration {
         [switch]$SwapExternal
     )
 
+    $mode = if ($Config.DisplayMode) { $Config.DisplayMode } else { 'extend' }
     try {
-        $sources = @(Wait-ExtendedDesktop -MinScreens $Config.MinScreens)
+        $sources = @(Wait-ExtendedDesktop -MinScreens $Config.MinScreens -Mode $mode)
     } catch {
-        $hint = if ($Config.MinScreens -ge 3) { "ouvrez l'ordinateur portable et vérifiez les branchements" } else { "vérifiez les branchements" }
-        throw "La configuration $($Config.Name) demande au moins $($Config.MinScreens) écrans actifs : $hint."
+        throw "La configuration $($Config.Name) n'a pas trouvé les écrans attendus : $($Config.MissingHint)."
     }
     if ($MaxResolution) { $sources = @(Set-MaxResolution -MinScreens $Config.MinScreens) }
 
@@ -1041,33 +1052,58 @@ Function Invoke-ScreenConfiguration {
 }
 
 # ========== CONFIGURATIONS ==========
-# Slots : rôles placés dans chaque emplacement de la géométrie (L = portable, M1 / M2 = écrans externes)
+# Postes de travail : les configurations sont regroupées par poste dans l'interface
+$script:Devices = @(
+    @{ Key = "Dual"; Name = "Poste à deux écrans" },
+    @{ Key = "UW34"; Name = "Poste avec écran 34 pouces" }
+)
+
+# Device : poste concerné ; Slots : rôles placés dans chaque emplacement de la géométrie (L = portable, M1 / M2 = écrans externes)
 # Primary : rôle de l'écran principal ; Fallback : disposition utilisée quand le portable est fermé
+# MinScreens / MinExternal : écrans actifs nécessaires ; DisplayMode external : seul l'écran externe reste allumé
 $script:Configs = @(
     @{
-        Key = "TOpen"; Name = "T ouvert"; Image = "t-ouvert.png"; Favorite = $true
+        Key = "TOpen"; Name = "T ouvert"; Device = "Dual"; Image = "t-ouvert.png"; Favorite = $true
         Description = "Portable ouvert sous les deux écrans"
         PrimaryLabel = "l'écran du portable"
-        Geometry = "T"; Slots = @("M1", "M2", "L"); Primary = "L"; MinScreens = 3
+        Geometry = "T"; Slots = @("M1", "M2", "L"); Primary = "L"; MinScreens = 3; MinExternal = 2
+        MissingHint = "ouvrez l'ordinateur portable et vérifiez que les deux écrans sont branchés"
     },
     @{
-        Key = "LineRightClosed"; Name = "Ligne D fermé"; Image = "ligne-d-ferme.png"; Favorite = $false
+        Key = "LineRightClosed"; Name = "Ligne D fermé"; Device = "Dual"; Image = "ligne-d-ferme.png"; Favorite = $false
         Description = "Portable fermé à droite des deux écrans"
         PrimaryLabel = "l'écran externe de gauche"
-        Geometry = "LineOut"; Slots = @("M1", "M2", "L"); Primary = "M1"; MinScreens = 2
+        Geometry = "LineOut"; Slots = @("M1", "M2", "L"); Primary = "M1"; MinScreens = 2; MinExternal = 2
         Fallback = @{ Geometry = "Horizontal"; Slots = @("M1", "M2"); Primary = "M1" }
+        MissingHint = "vérifiez que les deux écrans sont branchés"
     },
     @{
-        Key = "LineRightOpen"; Name = "Ligne D ouvert"; Image = "ligne-d-ouvert.png"; Favorite = $false
+        Key = "LineRightOpen"; Name = "Ligne D ouvert"; Device = "Dual"; Image = "ligne-d-ouvert.png"; Favorite = $false
         Description = "Portable ouvert à droite des deux écrans"
         PrimaryLabel = "l'écran du portable"
-        Geometry = "Horizontal"; Slots = @("M1", "M2", "L"); Primary = "L"; MinScreens = 3
+        Geometry = "Horizontal"; Slots = @("M1", "M2", "L"); Primary = "L"; MinScreens = 3; MinExternal = 2
+        MissingHint = "ouvrez l'ordinateur portable et vérifiez que les deux écrans sont branchés"
     },
     @{
-        Key = "LineLeftOpen"; Name = "Ligne G ouvert"; Image = "ligne-g-ouvert.png"; Favorite = $false
+        Key = "LineLeftOpen"; Name = "Ligne G ouvert"; Device = "Dual"; Image = "ligne-g-ouvert.png"; Favorite = $false
         Description = "Portable ouvert à gauche des deux écrans"
         PrimaryLabel = "l'écran du portable"
-        Geometry = "Horizontal"; Slots = @("L", "M1", "M2"); Primary = "L"; MinScreens = 3
+        Geometry = "Horizontal"; Slots = @("L", "M1", "M2"); Primary = "L"; MinScreens = 3; MinExternal = 2
+        MissingHint = "ouvrez l'ordinateur portable et vérifiez que les deux écrans sont branchés"
+    },
+    @{
+        Key = "UW34Open"; Name = "34″ ouvert"; Device = "UW34"; Image = "34-ouvert.png"; Favorite = $false
+        Description = "Portable ouvert sous l'écran 34 pouces"
+        PrimaryLabel = "l'écran du portable"
+        Geometry = "Below"; Slots = @("M1", "L"); Primary = "L"; MinScreens = 2; MinExternal = 1
+        MissingHint = "ouvrez l'ordinateur portable et vérifiez que l'écran 34 pouces est branché"
+    },
+    @{
+        Key = "UW34Closed"; Name = "34″ fermé"; Device = "UW34"; Image = "34-ferme.png"; Favorite = $false
+        Description = "Écran 34 pouces seul, portable fermé"
+        PrimaryLabel = "l'écran 34 pouces, seul écran utilisé"
+        Geometry = "Horizontal"; Slots = @("M1"); Primary = "M1"; MinScreens = 1; MinExternal = 1; DisplayMode = "external"
+        MissingHint = "vérifiez que l'écran 34 pouces est branché"
     }
 )
 
@@ -1120,14 +1156,7 @@ Function Import-Settings {
 
 Import-Settings
 
-# Configuration sélectionnée (par défaut : la première favorite)
 $script:SelectedLayoutIndex = 0
-for ($i = 0; $i -lt $script:Configs.Count; $i++) {
-    if ($script:Configs[$i].Favorite) {
-        $script:SelectedLayoutIndex = $i
-        break
-    }
-}
 $script:ShowFavoritesOnly = $false
 $script:LastLayoutWarning = $null
 $script:LastResolutionChanges = @()
@@ -1161,7 +1190,33 @@ Function Get-DisplayLabel {
     return "$(Get-DisplayName -Index $Index)`n$($d.Width) × $($d.Height)"
 }
 
+# Poste reconnu d'après les écrans externes branchés : deux écrans, ou un seul grand écran (34 pouces / ultra-large)
+Function Get-DetectedDevice {
+    $externals = @($script:Displays | Where-Object { -not $_.IsInternal })
+    If ($externals.Count -ge 2) { return "Dual" }
+    If ($externals.Count -eq 1) {
+        $d = $externals[0]
+        $diagonal = If ($d.Edid) { $d.Edid.DiagonalInches } Else { 0 }
+        $ratio = If ($d.Height -gt 0) { $d.Width / $d.Height } Else { 0 }
+        If ($diagonal -ge 30 -or $ratio -ge 2.1) { return "UW34" }
+    }
+    return $null
+}
+
 Update-DisplayInfo
+$script:DetectedDevice = Get-DetectedDevice
+
+# Configuration sélectionnée au démarrage : la première favorite du poste détecté (sinon sa première configuration),
+# ou la première favorite tout court si le poste n'est pas reconnu
+$candidates = @(For ($i = 0; $i -lt $script:Configs.Count; $i++) {
+    If (-not $script:DetectedDevice -or $script:Configs[$i].Device -eq $script:DetectedDevice) { $i }
+})
+$favoriteCandidates = @($candidates | Where-Object { $script:Configs[$_].Favorite })
+If ($favoriteCandidates.Count -gt 0) {
+    $script:SelectedLayoutIndex = $favoriteCandidates[0]
+} ElseIf ($candidates.Count -gt 0) {
+    $script:SelectedLayoutIndex = $candidates[0]
+}
 
 # ========== THÈME WINDOWS (clair / sombre, couleur d'accent) ==========
 Function Get-WindowsUsesLightTheme {
@@ -1488,7 +1543,7 @@ Function New-Brush {
                         </StackPanel>
                     </ToggleButton>
                 </Grid>
-                <WrapPanel x:Name="pnlCards" Margin="-4,0,-4,0"/>
+                <StackPanel x:Name="pnlCards"/>
                 <TextBlock x:Name="txtNoFavorites" Visibility="Collapsed" Foreground="$($C.TextSecondary)" Margin="0,4,0,0" TextWrapping="Wrap"
                            Text="Aucune configuration favorite. Cliquez sur l'étoile d'une configuration pour l'ajouter aux favoris."/>
 
@@ -1684,6 +1739,165 @@ Function Switch-Favorite {
     Build-Cards
 }
 
+# Carte d'une configuration : vignette, nom, description et étoile favoris
+Function New-ConfigCard {
+    param([int]$Index)
+
+    $config = $script:Configs[$Index]
+    $isSelected = ($Index -eq $script:SelectedLayoutIndex)
+
+    # Carte sélectionnable : bordure d'accent quand elle est choisie (épaisseur compensée par le padding)
+    $card = [System.Windows.Controls.Border]::new()
+    $card.Width = 214
+    $card.Margin = [System.Windows.Thickness]::new(4)
+    $card.CornerRadius = [System.Windows.CornerRadius]::new(6)
+    $card.Background = New-Brush $C.Card
+    If ($isSelected) {
+        $card.BorderBrush = New-Brush $C.Accent
+        $card.BorderThickness = [System.Windows.Thickness]::new(2)
+        $card.Padding = [System.Windows.Thickness]::new(9)
+    } Else {
+        $card.BorderBrush = New-Brush $C.CardBorder
+        $card.BorderThickness = [System.Windows.Thickness]::new(1)
+        $card.Padding = [System.Windows.Thickness]::new(10)
+    }
+    $card.Tag = $Index
+    $card.ToolTip = "Choisir la configuration $($config.Name)"
+
+    $ctxMenu = [System.Windows.Controls.ContextMenu]::new()
+    $miFav = [System.Windows.Controls.MenuItem]::new()
+    If ($config.Favorite) {
+        $miFav.Header = "Retirer des favoris"
+    } Else {
+        $miFav.Header = "Ajouter aux favoris"
+    }
+    $miFav.Tag = $Index
+    $miFav.Add_Click({
+        param($sender, $e)
+        Switch-Favorite -LayoutIndex $sender.Tag
+    })
+    $ctxMenu.Items.Add($miFav) | Out-Null
+    $card.ContextMenu = $ctxMenu
+
+    $grid = [System.Windows.Controls.Grid]::new()
+    $row1 = [System.Windows.Controls.RowDefinition]::new(); $row1.Height = [System.Windows.GridLength]::Auto
+    $row2 = [System.Windows.Controls.RowDefinition]::new(); $row2.Height = [System.Windows.GridLength]::Auto
+    $grid.RowDefinitions.Add($row1)
+    $grid.RowDefinitions.Add($row2)
+
+    # Vignette
+    $thumb = [System.Windows.Controls.Border]::new()
+    $thumb.Height = 96
+    $thumb.CornerRadius = [System.Windows.CornerRadius]::new(4)
+    $thumb.Background = New-Brush $C.Illustration
+    $thumb.Padding = [System.Windows.Thickness]::new(8)
+    $thumb.Child = New-ConfigVisual -Config $config
+    $grid.Children.Add($thumb) | Out-Null
+
+    # Nom, description et étoile favoris
+    $labelRow = [System.Windows.Controls.Grid]::new()
+    $labelRow.Margin = [System.Windows.Thickness]::new(2, 10, 0, 0)
+    $col1 = [System.Windows.Controls.ColumnDefinition]::new()
+    $col1.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+    $col2 = [System.Windows.Controls.ColumnDefinition]::new()
+    $col2.Width = [System.Windows.GridLength]::Auto
+    $labelRow.ColumnDefinitions.Add($col1)
+    $labelRow.ColumnDefinitions.Add($col2)
+    [System.Windows.Controls.Grid]::SetRow($labelRow, 1)
+
+    $texts = [System.Windows.Controls.StackPanel]::new()
+    $title = [System.Windows.Controls.TextBlock]::new()
+    $title.Text = $config.Name
+    $title.FontWeight = If ($isSelected) { "SemiBold" } Else { "Normal" }
+    $texts.Children.Add($title) | Out-Null
+    $desc = [System.Windows.Controls.TextBlock]::new()
+    $desc.Text = $config.Description
+    $desc.FontSize = 12
+    $desc.Foreground = New-Brush $C.TextSecondary
+    $desc.TextWrapping = "Wrap"
+    $texts.Children.Add($desc) | Out-Null
+    $labelRow.Children.Add($texts) | Out-Null
+
+    $star = [System.Windows.Controls.Button]::new()
+    $star.Style = $window.FindResource("BtnIcon")
+    $star.VerticalAlignment = "Top"
+    $star.Margin = [System.Windows.Thickness]::new(4, -4, -4, 0)
+    $starGlyph = [System.Windows.Controls.TextBlock]::new()
+    $starGlyph.FontFamily = [System.Windows.Media.FontFamily]::new($script:IconFont)
+    $starGlyph.FontSize = 16
+    If ($config.Favorite) {
+        $starGlyph.Text = [string][char]0xE735
+        $starGlyph.Foreground = New-Brush $C.Accent
+        $star.ToolTip = "Retirer des favoris"
+    } Else {
+        $starGlyph.Text = [string][char]0xE734
+        $starGlyph.Foreground = New-Brush $C.TextSecondary
+        $star.ToolTip = "Ajouter aux favoris"
+    }
+    [System.Windows.Automation.AutomationProperties]::SetName($star, $star.ToolTip)
+    $star.Content = $starGlyph
+    $star.Tag = $Index
+    $star.Add_Click({
+        param($sender, $e)
+        Switch-Favorite -LayoutIndex $sender.Tag
+    })
+    [System.Windows.Controls.Grid]::SetColumn($star, 1)
+    $labelRow.Children.Add($star) | Out-Null
+    $grid.Children.Add($labelRow) | Out-Null
+
+    $card.Child = $grid
+
+    $card.Add_MouseEnter({
+        param($sender, $e)
+        If ($sender.Tag -ne $script:SelectedLayoutIndex) { $sender.Background = New-Brush $C.CardHover }
+    })
+    $card.Add_MouseLeave({
+        param($sender, $e)
+        $sender.Background = New-Brush $C.Card
+    })
+    $card.Add_MouseLeftButtonDown({
+        param($sender, $e)
+        $script:SelectedLayoutIndex = $sender.Tag
+        Set-Status "" "None"
+        Build-Cards
+        Update-Preview
+    })
+
+    return $card
+}
+
+# Titre d'un groupe de configurations, avec un badge si ce poste est celui détecté
+Function New-DeviceHeader {
+    param($Device)
+
+    $header = [System.Windows.Controls.StackPanel]::new()
+    $header.Orientation = "Horizontal"
+    $header.Margin = [System.Windows.Thickness]::new(0, 12, 0, 6)
+
+    $name = [System.Windows.Controls.TextBlock]::new()
+    $name.Text = $Device.Name
+    $name.FontSize = 13
+    $name.Foreground = New-Brush $C.TextSecondary
+    $name.VerticalAlignment = "Center"
+    $header.Children.Add($name) | Out-Null
+
+    If ($script:DetectedDevice -eq $Device.Key) {
+        $badgeText = [System.Windows.Controls.TextBlock]::new()
+        $badgeText.Text = "Détecté"
+        $badgeText.FontSize = 11
+        $badgeText.Foreground = New-Brush $C.AccentText
+        $badge = [System.Windows.Controls.Border]::new()
+        $badge.Background = New-Brush $C.Accent
+        $badge.CornerRadius = [System.Windows.CornerRadius]::new(8)
+        $badge.Padding = [System.Windows.Thickness]::new(8, 1, 8, 2)
+        $badge.Margin = [System.Windows.Thickness]::new(10, 0, 0, 0)
+        $badge.VerticalAlignment = "Center"
+        $badge.Child = $badgeText
+        $header.Children.Add($badge) | Out-Null
+    }
+    return $header
+}
+
 Function Build-Cards {
     $pnlCards.Children.Clear()
 
@@ -1693,138 +1907,27 @@ Function Build-Cards {
         }
     }
 
+    # Un groupe par poste ; le poste détecté passe en premier
+    $devices = @($script:Devices | Where-Object { $_.Key -eq $script:DetectedDevice }) + @($script:Devices | Where-Object { $_.Key -ne $script:DetectedDevice })
     $shown = 0
-    For ($i = 0; $i -lt $script:Configs.Count; $i++) {
-        $config = $script:Configs[$i]
-        If ($script:ShowFavoritesOnly -and -not $config.Favorite) { continue }
-        $shown++
-        $idx = $i
-
-        $isSelected = ($i -eq $script:SelectedLayoutIndex)
-
-        # Carte sélectionnable : bordure d'accent quand elle est choisie (épaisseur compensée par le padding)
-        $card = [System.Windows.Controls.Border]::new()
-        $card.Width = 214
-        $card.Margin = [System.Windows.Thickness]::new(4)
-        $card.CornerRadius = [System.Windows.CornerRadius]::new(6)
-        $card.Background = New-Brush $C.Card
-        If ($isSelected) {
-            $card.BorderBrush = New-Brush $C.Accent
-            $card.BorderThickness = [System.Windows.Thickness]::new(2)
-            $card.Padding = [System.Windows.Thickness]::new(9)
-        } Else {
-            $card.BorderBrush = New-Brush $C.CardBorder
-            $card.BorderThickness = [System.Windows.Thickness]::new(1)
-            $card.Padding = [System.Windows.Thickness]::new(10)
+    ForEach ($device In $devices) {
+        $wrap = [System.Windows.Controls.WrapPanel]::new()
+        $wrap.Margin = [System.Windows.Thickness]::new(-4, 0, -4, 0)
+        For ($i = 0; $i -lt $script:Configs.Count; $i++) {
+            $config = $script:Configs[$i]
+            If ($config.Device -ne $device.Key) { continue }
+            If ($script:ShowFavoritesOnly -and -not $config.Favorite) { continue }
+            $wrap.Children.Add((New-ConfigCard -Index $i)) | Out-Null
         }
-        $card.Tag = $idx
-        $card.ToolTip = "Choisir la configuration $($config.Name)"
+        If ($wrap.Children.Count -eq 0) { continue }
 
-        $ctxMenu = [System.Windows.Controls.ContextMenu]::new()
-        $miFav = [System.Windows.Controls.MenuItem]::new()
-        If ($config.Favorite) {
-            $miFav.Header = "Retirer des favoris"
-        } Else {
-            $miFav.Header = "Ajouter aux favoris"
-        }
-        $miFav.Tag = $idx
-        $miFav.Add_Click({
-            param($sender, $e)
-            Switch-Favorite -LayoutIndex $sender.Tag
-        })
-        $ctxMenu.Items.Add($miFav) | Out-Null
-        $card.ContextMenu = $ctxMenu
-
-        $grid = [System.Windows.Controls.Grid]::new()
-        $row1 = [System.Windows.Controls.RowDefinition]::new(); $row1.Height = [System.Windows.GridLength]::Auto
-        $row2 = [System.Windows.Controls.RowDefinition]::new(); $row2.Height = [System.Windows.GridLength]::Auto
-        $grid.RowDefinitions.Add($row1)
-        $grid.RowDefinitions.Add($row2)
-
-        # Vignette
-        $thumb = [System.Windows.Controls.Border]::new()
-        $thumb.Height = 96
-        $thumb.CornerRadius = [System.Windows.CornerRadius]::new(4)
-        $thumb.Background = New-Brush $C.Illustration
-        $thumb.Padding = [System.Windows.Thickness]::new(8)
-        $thumb.Child = New-ConfigVisual -Config $config
-        $grid.Children.Add($thumb) | Out-Null
-
-        # Nom, description et étoile favoris
-        $labelRow = [System.Windows.Controls.Grid]::new()
-        $labelRow.Margin = [System.Windows.Thickness]::new(2, 10, 0, 0)
-        $col1 = [System.Windows.Controls.ColumnDefinition]::new()
-        $col1.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
-        $col2 = [System.Windows.Controls.ColumnDefinition]::new()
-        $col2.Width = [System.Windows.GridLength]::Auto
-        $labelRow.ColumnDefinitions.Add($col1)
-        $labelRow.ColumnDefinitions.Add($col2)
-        [System.Windows.Controls.Grid]::SetRow($labelRow, 1)
-
-        $texts = [System.Windows.Controls.StackPanel]::new()
-        $title = [System.Windows.Controls.TextBlock]::new()
-        $title.Text = $config.Name
-        $title.FontWeight = If ($isSelected) { "SemiBold" } Else { "Normal" }
-        $texts.Children.Add($title) | Out-Null
-        $desc = [System.Windows.Controls.TextBlock]::new()
-        $desc.Text = $config.Description
-        $desc.FontSize = 12
-        $desc.Foreground = New-Brush $C.TextSecondary
-        $desc.TextWrapping = "Wrap"
-        $texts.Children.Add($desc) | Out-Null
-        $labelRow.Children.Add($texts) | Out-Null
-
-        $star = [System.Windows.Controls.Button]::new()
-        $star.Style = $window.FindResource("BtnIcon")
-        $star.VerticalAlignment = "Top"
-        $star.Margin = [System.Windows.Thickness]::new(4, -4, -4, 0)
-        $starGlyph = [System.Windows.Controls.TextBlock]::new()
-        $starGlyph.FontFamily = [System.Windows.Media.FontFamily]::new($script:IconFont)
-        $starGlyph.FontSize = 16
-        If ($config.Favorite) {
-            $starGlyph.Text = [string][char]0xE735
-            $starGlyph.Foreground = New-Brush $C.Accent
-            $star.ToolTip = "Retirer des favoris"
-        } Else {
-            $starGlyph.Text = [string][char]0xE734
-            $starGlyph.Foreground = New-Brush $C.TextSecondary
-            $star.ToolTip = "Ajouter aux favoris"
-        }
-        [System.Windows.Automation.AutomationProperties]::SetName($star, $star.ToolTip)
-        $star.Content = $starGlyph
-        $star.Tag = $idx
-        $star.Add_Click({
-            param($sender, $e)
-            Switch-Favorite -LayoutIndex $sender.Tag
-        })
-        [System.Windows.Controls.Grid]::SetColumn($star, 1)
-        $labelRow.Children.Add($star) | Out-Null
-        $grid.Children.Add($labelRow) | Out-Null
-
-        $card.Child = $grid
-
-        $card.Add_MouseEnter({
-            param($sender, $e)
-            If ($sender.Tag -ne $script:SelectedLayoutIndex) { $sender.Background = New-Brush $C.CardHover }
-        })
-        $card.Add_MouseLeave({
-            param($sender, $e)
-            $sender.Background = New-Brush $C.Card
-        })
-        $card.Add_MouseLeftButtonDown({
-            param($sender, $e)
-            $script:SelectedLayoutIndex = $sender.Tag
-            Set-Status "" "None"
-            Build-Cards
-            Update-Preview
-        })
-
-        $pnlCards.Children.Add($card) | Out-Null
+        $shown += $wrap.Children.Count
+        $pnlCards.Children.Add((New-DeviceHeader -Device $device)) | Out-Null
+        $pnlCards.Children.Add($wrap) | Out-Null
     }
 
     $txtNoFavorites.Visibility = If ($shown -eq 0) { "Visible" } Else { "Collapsed" }
 }
-
 # Grande image de la configuration choisie, écran principal et écrans détectés
 Function Update-Preview {
     $config = $script:Configs[$script:SelectedLayoutIndex]
@@ -1835,11 +1938,11 @@ Function Update-Preview {
     $count = $script:Displays.Count
     $internal = @($script:Displays | Where-Object { $_.IsInternal }).Count
     $external = $count - $internal
-    If ($count -lt $config.MinScreens) {
+    If ($count -lt $config.MinScreens -or $external -lt $config.MinExternal) {
         $txtPreviewIcon.Text = [string][char]0xE7BA
         $txtPreviewIcon.Foreground = New-Brush $C.WarningFg
-        $hint = If ($config.MinScreens -ge 3) { "Ouvrez l'ordinateur portable et vérifiez les branchements." } Else { "Vérifiez les branchements." }
-        $txtDetect.Text = "Cette configuration demande $($config.MinScreens) écrans actifs, $count détecté(s) pour le moment. $hint"
+        $hint = $config.MissingHint.Substring(0, 1).ToUpper() + $config.MissingHint.Substring(1)
+        $txtDetect.Text = "Écrans attendus non détectés pour le moment ($external externe(s) sur $($config.MinExternal)). $hint."
     } Else {
         $txtPreviewIcon.Text = [string][char]0xE80F
         $txtPreviewIcon.Foreground = New-Brush $C.Text
@@ -1885,6 +1988,8 @@ Function Set-LayoutFromGui {
     }
 
     Update-DisplayInfo
+    $script:DetectedDevice = Get-DetectedDevice
+    Build-Cards
     Update-Preview
 }
 
