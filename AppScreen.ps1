@@ -8,7 +8,7 @@ Add-Type -AssemblyName WindowsBase
 
 # ========== INTÉGRATION DE DisplayApi ==========
 $displayApiType = ([System.Management.Automation.PSTypeName]'DisplayApi').Type
-If ($displayApiType -and (-not $displayApiType.GetField('Version') -or $displayApiType.GetField('Version').GetValue($null) -lt 6)) {
+If ($displayApiType -and (-not $displayApiType.GetField('Version') -or $displayApiType.GetField('Version').GetValue($null) -lt 7)) {
     # Un type déjà compilé ne peut pas être remplacé dans la même session PowerShell
     throw "Une ancienne version de DisplayApi est déjà chargée dans cette session PowerShell. Fermez-la puis relancez le script."
 }
@@ -23,7 +23,7 @@ public struct POINTL { public int x; public int y; }
 
 public static class DisplayApi
 {
-    public const int Version = 6;
+    public const int Version = 7;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct LUID { public uint LowPart; public int HighPart; }
@@ -225,7 +225,10 @@ public static class DisplayApi
     [DllImport("user32.dll")]
     static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
 
+    const uint QDC_ALL_PATHS                      = 0x00000001;
     const uint QDC_ONLY_ACTIVE_PATHS              = 0x00000002;
+    const uint DISPLAYCONFIG_PATH_ACTIVE          = 0x00000001;
+    const int  ERROR_INSUFFICIENT_BUFFER          = 122;
     const uint SDC_APPLY                          = 0x00000080;
     const uint SDC_USE_SUPPLIED_DISPLAY_CONFIG    = 0x00000020;
     const uint SDC_NO_OPTIMIZATION                = 0x00000100;
@@ -278,10 +281,29 @@ public static class DisplayApi
         // Écran principal selon Windows (indicateur GDI) ; à défaut de nom GDI, celui placé à l'origine du bureau
         public bool IsPrimary;
 
-        // Dalle d'ordinateur portable : connexion interne, LVDS ou DisplayPort / UDI intégré
-        public bool IsInternal {
-            get { return OutputTechnology == 0x80000000 || OutputTechnology == 6 || OutputTechnology == 11 || OutputTechnology == 13; }
-        }
+        public bool IsInternal { get { return IsInternalTechnology(OutputTechnology); } }
+    }
+
+    // Moniteur branché, qu'il soit allumé ou non par Windows
+    public class MonitorInfo {
+        public string Key = "";
+        public uint TargetId;
+        public LUID Adapter;
+        public uint OutputTechnology;
+        public string FriendlyName = "";
+        public string DevicePath = "";
+        public string PnpId = "";
+        public EdidInfo Edid;
+        public int PreferredWidth, PreferredHeight;
+        public bool IsActive;
+
+        public bool IsInternal { get { return IsInternalTechnology(OutputTechnology); } }
+    }
+
+    // Dalle d'ordinateur portable : connexion interne, LVDS ou DisplayPort / UDI intégré
+    public static bool IsInternalTechnology(uint outputTechnology)
+    {
+        return outputTechnology == 0x80000000 || outputTechnology == 6 || outputTechnology == 11 || outputTechnology == 13;
     }
 
     public class ResolutionChange {
@@ -319,6 +341,92 @@ public static class DisplayApi
         return a.LowPart == b.LowPart && a.HighPart == b.HighPart;
     }
 
+    // Nom, chemin, EDID et résolution native du moniteur relié à une cible d'affichage
+    static MonitorInfo ReadMonitor(DISPLAYCONFIG_PATH_TARGET_INFO ti)
+    {
+        var monitor = new MonitorInfo();
+        monitor.Key = MakeKey(ti.adapterId, ti.id);
+        monitor.TargetId = ti.id;
+        monitor.Adapter = ti.adapterId;
+        monitor.OutputTechnology = ti.outputTechnology;
+        try
+        {
+            var pref = new DISPLAYCONFIG_TARGET_PREFERRED_MODE();
+            pref.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE;
+            pref.header.size = (uint)Marshal.SizeOf(typeof(DISPLAYCONFIG_TARGET_PREFERRED_MODE));
+            pref.header.adapterId = ti.adapterId;
+            pref.header.id = ti.id;
+            if (DisplayConfigGetDeviceInfo(ref pref) == 0)
+            {
+                monitor.PreferredWidth = (int)pref.width;
+                monitor.PreferredHeight = (int)pref.height;
+            }
+
+            var tgt = new DISPLAYCONFIG_TARGET_DEVICE_NAME();
+            tgt.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+            tgt.header.size = (uint)Marshal.SizeOf(typeof(DISPLAYCONFIG_TARGET_DEVICE_NAME));
+            tgt.header.adapterId = ti.adapterId;
+            tgt.header.id = ti.id;
+            if (DisplayConfigGetDeviceInfo(ref tgt) == 0)
+            {
+                monitor.FriendlyName = (tgt.monitorFriendlyDeviceName ?? "").Trim();
+                monitor.DevicePath = tgt.monitorDevicePath ?? "";
+
+                // \\?\DISPLAY#DEL40A1#5&10a58edf&0&UID4352#{guid} -> Enum\DISPLAY\DEL40A1\5&10a58edf&0&UID4352
+                string[] parts = monitor.DevicePath.Split('#');
+                if (parts.Length >= 3)
+                {
+                    monitor.PnpId = parts[1];
+                    monitor.Edid = ReadEdid(@"SYSTEM\CurrentControlSet\Enum\DISPLAY\" + parts[1] + @"\" + parts[2] + @"\Device Parameters");
+                }
+            }
+        }
+        catch
+        {
+            // Informations facultatives
+        }
+        return monitor;
+    }
+
+    // Moniteurs branchés, allumés ou non (ex. dalle du portable coupée par "Deuxième écran uniquement")
+    public static List<MonitorInfo> GetConnectedMonitors()
+    {
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            uint pathCount, modeCount;
+            if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, out pathCount, out modeCount) != 0) return null;
+            var paths = new DISPLAYCONFIG_PATH_INFO[pathCount];
+            var modes = new DISPLAYCONFIG_MODE_INFO[modeCount];
+            int r = QueryDisplayConfig(QDC_ALL_PATHS, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
+            if (r == ERROR_INSUFFICIENT_BUFFER) continue; // la configuration a changé entre les deux appels
+            if (r != 0) return null;
+
+            // Un même moniteur apparaît dans plusieurs chemins (un par source possible) : dédoublonnage par cible
+            var list = new List<MonitorInfo>();
+            var seen = new Dictionary<string, MonitorInfo>();
+            for (int p = 0; p < pathCount && p < paths.Length; p++)
+            {
+                var ti = paths[p].targetInfo;
+                if (!ti.targetAvailable) continue;
+                bool active = (paths[p].flags & DISPLAYCONFIG_PATH_ACTIVE) != 0;
+
+                MonitorInfo existing;
+                string key = MakeKey(ti.adapterId, ti.id);
+                if (seen.TryGetValue(key, out existing))
+                {
+                    if (active) existing.IsActive = true;
+                    continue;
+                }
+                var monitor = ReadMonitor(ti);
+                monitor.IsActive = active;
+                seen[key] = monitor;
+                list.Add(monitor);
+            }
+            return list;
+        }
+        return null;
+    }
+
     static void FillMonitorInfo(SourceInfo info, DISPLAYCONFIG_PATH_INFO[] paths, uint pathCount)
     {
         try
@@ -337,38 +445,15 @@ public static class DisplayApi
                 if (si.id != info.Id || !SameAdapter(si.adapterId, info.Adapter)) continue;
 
                 var ti = paths[p].targetInfo;
+                var monitor = ReadMonitor(ti);
                 info.TargetId = ti.id;
                 info.OutputTechnology = ti.outputTechnology;
-
-                var pref = new DISPLAYCONFIG_TARGET_PREFERRED_MODE();
-                pref.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE;
-                pref.header.size = (uint)Marshal.SizeOf(typeof(DISPLAYCONFIG_TARGET_PREFERRED_MODE));
-                pref.header.adapterId = ti.adapterId;
-                pref.header.id = ti.id;
-                if (DisplayConfigGetDeviceInfo(ref pref) == 0)
-                {
-                    info.PreferredWidth = (int)pref.width;
-                    info.PreferredHeight = (int)pref.height;
-                }
-
-                var tgt = new DISPLAYCONFIG_TARGET_DEVICE_NAME();
-                tgt.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-                tgt.header.size = (uint)Marshal.SizeOf(typeof(DISPLAYCONFIG_TARGET_DEVICE_NAME));
-                tgt.header.adapterId = ti.adapterId;
-                tgt.header.id = ti.id;
-                if (DisplayConfigGetDeviceInfo(ref tgt) == 0)
-                {
-                    info.FriendlyName = (tgt.monitorFriendlyDeviceName ?? "").Trim();
-                    info.DevicePath = tgt.monitorDevicePath ?? "";
-
-                    // \\?\DISPLAY#DEL40A1#5&10a58edf&0&UID4352#{guid} -> Enum\DISPLAY\DEL40A1\5&10a58edf&0&UID4352
-                    string[] parts = info.DevicePath.Split('#');
-                    if (parts.Length >= 3)
-                    {
-                        info.PnpId = parts[1];
-                        info.Edid = ReadEdid(@"SYSTEM\CurrentControlSet\Enum\DISPLAY\" + parts[1] + @"\" + parts[2] + @"\Device Parameters");
-                    }
-                }
+                info.PreferredWidth = monitor.PreferredWidth;
+                info.PreferredHeight = monitor.PreferredHeight;
+                info.FriendlyName = monitor.FriendlyName;
+                info.DevicePath = monitor.DevicePath;
+                info.PnpId = monitor.PnpId;
+                info.Edid = monitor.Edid;
                 break;
             }
         }
@@ -1274,11 +1359,26 @@ $script:LastLayoutWarning = $null
 $script:LastResolutionChanges = @()
 
 # ========== ÉCRANS CONNECTÉS ==========
+# Displays : écrans allumés (sources du bureau) ; Monitors : moniteurs branchés, allumés ou non
 $script:Displays = @()
+$script:Monitors = @()
+$script:DisplaySignature = ""
 
 Function Update-DisplayInfo {
     Try { $list = [DisplayApi]::GetSources() } Catch { $list = $null }
     $script:Displays = @(If ($list) { $list })
+    Try { $connected = [DisplayApi]::GetConnectedMonitors() } Catch { $connected = $null }
+    $script:Monitors = @(If ($connected) { $connected })
+
+    # Empreinte de l'état des écrans : sert à ne rafraîchir l'interface que si quelque chose a changé
+    $script:DisplaySignature = (@($script:Monitors | ForEach-Object { "$($_.Key):$($_.IsActive)" }) +
+                                @($script:Displays | ForEach-Object { "$($_.Key)@$($_.X),$($_.Y),$($_.Width)x$($_.Height)" })) -join ';'
+}
+
+# Moniteurs branchés ; à défaut (API indisponible), les écrans allumés
+Function Get-ConnectedScreens {
+    If ($script:Monitors.Count -gt 0) { return $script:Monitors }
+    return $script:Displays
 }
 
 Function Get-DisplayName {
@@ -1302,34 +1402,47 @@ Function Get-DisplayLabel {
     return "$(Get-DisplayName -Index $Index)`n$($d.Width) × $($d.Height)"
 }
 
-# Poste reconnu d'après les écrans externes branchés : deux écrans, un écran 34 pouces (ultra-large) ou un écran 27 pouces
+# Poste reconnu d'après les écrans externes branchés (allumés ou non) : deux écrans, un écran 34 pouces (ultra-large) ou un écran 27 pouces
 Function Get-DetectedDevice {
-    $externals = @($script:Displays | Where-Object { -not $_.IsInternal })
+    $externals = @(Get-ConnectedScreens | Where-Object { -not $_.IsInternal })
     If ($externals.Count -ge 2) { return "Dual" }
     If ($externals.Count -eq 1) {
         $d = $externals[0]
         $diagonal = If ($d.Edid) { $d.Edid.DiagonalInches } Else { 0 }
-        $ratio = If ($d.Height -gt 0) { $d.Width / $d.Height } Else { 0 }
+        $width = If ($d.PreferredWidth) { $d.PreferredWidth } Else { $d.Width }
+        $height = If ($d.PreferredHeight) { $d.PreferredHeight } Else { $d.Height }
+        $ratio = If ($height -gt 0) { $width / $height } Else { 0 }
         If ($diagonal -ge 30 -or $ratio -ge 2.1) { return "UW34" }
         return "M27"
     }
     return $null
 }
 
+# Configurations proposées : celles du poste détecté, ou toutes si aucun poste n'est reconnu
+Function Get-CompatibleConfigIndexes {
+    For ($i = 0; $i -lt $script:Configs.Count; $i++) {
+        If (-not $script:DetectedDevice -or $script:Configs[$i].Device -eq $script:DetectedDevice) { $i }
+    }
+}
+
+# Sélectionne la première favorite compatible, sinon la première configuration compatible ;
+# avec -KeepCurrent, la sélection actuelle est conservée si elle reste compatible
+Function Select-CompatibleConfig {
+    param([switch]$KeepCurrent)
+
+    $candidates = @(Get-CompatibleConfigIndexes)
+    If ($KeepCurrent -and $candidates -contains $script:SelectedLayoutIndex) { return }
+    $favorites = @($candidates | Where-Object { $script:Configs[$_].Favorite })
+    If ($favorites.Count -gt 0) {
+        $script:SelectedLayoutIndex = $favorites[0]
+    } ElseIf ($candidates.Count -gt 0) {
+        $script:SelectedLayoutIndex = $candidates[0]
+    }
+}
+
 Update-DisplayInfo
 $script:DetectedDevice = Get-DetectedDevice
-
-# Configuration sélectionnée au démarrage : la première favorite du poste détecté (sinon sa première configuration),
-# ou la première favorite tout court si le poste n'est pas reconnu
-$candidates = @(For ($i = 0; $i -lt $script:Configs.Count; $i++) {
-    If (-not $script:DetectedDevice -or $script:Configs[$i].Device -eq $script:DetectedDevice) { $i }
-})
-$favoriteCandidates = @($candidates | Where-Object { $script:Configs[$_].Favorite })
-If ($favoriteCandidates.Count -gt 0) {
-    $script:SelectedLayoutIndex = $favoriteCandidates[0]
-} ElseIf ($candidates.Count -gt 0) {
-    $script:SelectedLayoutIndex = $candidates[0]
-}
+Select-CompatibleConfig
 
 # ========== THÈME WINDOWS (clair / sombre, couleur d'accent) ==========
 Function Get-WindowsUsesLightTheme {
@@ -1678,7 +1791,7 @@ Function New-Brush {
                         <CheckBox x:Name="chkMaxRes" Grid.Column="2" Style="{StaticResource ToggleSwitch}" VerticalAlignment="Center" Margin="16,0,0,0"/>
                     </Grid>
                 </Border>
-                <Border Style="{StaticResource Card}" Padding="16,12" MinHeight="68">
+                <Border x:Name="bdSwapExternal" Style="{StaticResource Card}" Padding="16,12" MinHeight="68">
                     <Grid>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto"/>
@@ -1741,6 +1854,7 @@ $tglFavorites    = $window.FindName("tglFavorites")
 $txtNoFavorites  = $window.FindName("txtNoFavorites")
 $chkMaxRes       = $window.FindName("chkMaxRes")
 $chkSwapExternal = $window.FindName("chkSwapExternal")
+$bdSwapExternal  = $window.FindName("bdSwapExternal")
 
 # ========== FONCTIONS D'AFFICHAGE ==========
 $script:StatusStyles = @{
@@ -2015,15 +2129,24 @@ Function Build-Cards {
     $pnlCards.Children.Clear()
 
     If ($script:ShowFavoritesOnly -and -not $script:Configs[$script:SelectedLayoutIndex].Favorite) {
-        For ($j = 0; $j -lt $script:Configs.Count; $j++) {
-            If ($script:Configs[$j].Favorite) { $script:SelectedLayoutIndex = $j; break }
-        }
+        $favorite = @(Get-CompatibleConfigIndexes | Where-Object { $script:Configs[$_].Favorite }) | Select-Object -First 1
+        If ($null -ne $favorite) { $script:SelectedLayoutIndex = $favorite }
     }
 
-    # Un groupe par poste ; le poste détecté passe en premier
-    $devices = @($script:Devices | Where-Object { $_.Key -eq $script:DetectedDevice }) + @($script:Devices | Where-Object { $_.Key -ne $script:DetectedDevice })
+    # Aucun poste reconnu : toutes les configurations restent proposées, avec une explication
+    If (-not $script:DetectedDevice) {
+        $hint = [System.Windows.Controls.TextBlock]::new()
+        $hint.Text = "Aucun poste reconnu pour le moment : toutes les configurations sont proposées. Branchez les écrans de votre poste, la liste s'adaptera automatiquement."
+        $hint.FontSize = 12
+        $hint.Foreground = New-Brush $C.TextSecondary
+        $hint.TextWrapping = "Wrap"
+        $pnlCards.Children.Add($hint) | Out-Null
+    }
+
+    # Un groupe par poste ; seul le poste détecté est proposé quand il est reconnu
     $shown = 0
-    ForEach ($device In $devices) {
+    ForEach ($device In $script:Devices) {
+        If ($script:DetectedDevice -and $device.Key -ne $script:DetectedDevice) { continue }
         $wrap = [System.Windows.Controls.WrapPanel]::new()
         $wrap.Margin = [System.Windows.Thickness]::new(-4, 0, -4, 0)
         For ($i = 0; $i -lt $script:Configs.Count; $i++) {
@@ -2041,16 +2164,22 @@ Function Build-Cards {
 
     $txtNoFavorites.Visibility = If ($shown -eq 0) { "Visible" } Else { "Collapsed" }
 }
-# Grande image de la configuration choisie, écran principal et écrans détectés
+
+# Grande image de la configuration choisie, écran principal et écrans branchés
 Function Update-Preview {
     $config = $script:Configs[$script:SelectedLayoutIndex]
     $txtPreviewTitle.Text = "Aperçu : $($config.Name)"
     $bdPreview.Child = New-ConfigVisual -Config $config -Large $true
     $txtPrimaryInfo.Text = "Écran principal : $($config.PrimaryLabel)"
 
-    $count = $script:Displays.Count
-    $internal = @($script:Displays | Where-Object { $_.IsInternal }).Count
+    # L'inversion des écrans externes ne concerne que le poste à deux écrans
+    $bdSwapExternal.Visibility = If ($config.Device -eq "Dual") { "Visible" } Else { "Collapsed" }
+
+    $screens = @(Get-ConnectedScreens)
+    $count = $screens.Count
+    $internal = @($screens | Where-Object { $_.IsInternal }).Count
     $external = $count - $internal
+    $inactive = @($script:Monitors | Where-Object { -not $_.IsActive }).Count
     If ($count -lt $config.MinScreens -or $external -lt $config.MinExternal) {
         $txtPreviewIcon.Text = [string][char]0xE7BA
         $txtPreviewIcon.Foreground = New-Brush $C.WarningFg
@@ -2062,9 +2191,39 @@ Function Update-Preview {
         $parts = @()
         If ($external -gt 0) { $parts += "$external externe(s)" }
         If ($internal -gt 0) { $parts += "l'écran du portable" }
-        $txtDetect.Text = "$count écran(s) détecté(s) : $($parts -join ' + ')."
+        $txtDetect.Text = "$count écran(s) branché(s) : $($parts -join ' + ')."
+        If ($inactive -gt 0) { $txtDetect.Text += " $inactive éteint(s) pour le moment." }
     }
-    $txtDetect.ToolTip = (@(For ($i = 0; $i -lt $count; $i++) { "$($i + 1). $((Get-DisplayLabel -Index $i) -replace "`n", ' · ')" }) -join "`n")
+    $txtDetect.ToolTip = (@(For ($i = 0; $i -lt $script:Displays.Count; $i++) { "$($i + 1). $((Get-DisplayLabel -Index $i) -replace "`n", ' · ')" }) -join "`n")
+}
+
+# Suivi des écrans en temps réel : relit l'état des écrans et ne met l'interface à jour que s'il a changé.
+# Quand le poste reconnu change, seules ses configurations sont proposées et la sélection s'adapte.
+Function Invoke-DisplayRefresh {
+    param(
+        [switch]$Force,
+        [switch]$Quiet
+    )
+
+    $previousSignature = $script:DisplaySignature
+    $previousDevice = $script:DetectedDevice
+    Update-DisplayInfo
+    If (-not $Force -and $script:DisplaySignature -eq $previousSignature) { return }
+
+    $script:DetectedDevice = Get-DetectedDevice
+    If ($script:DetectedDevice -ne $previousDevice) {
+        Select-CompatibleConfig -KeepCurrent
+        If (-not $Quiet) {
+            If ($script:DetectedDevice) {
+                $deviceName = ($script:Devices | Where-Object { $_.Key -eq $script:DetectedDevice }).Name
+                Set-Status "$deviceName détecté : seules les configurations compatibles sont proposées." "Info"
+            } Else {
+                Set-Status "Aucun poste reconnu : toutes les configurations sont proposées." "Info"
+            }
+        }
+    }
+    Build-Cards
+    Update-Preview
 }
 
 Function Set-LayoutFromGui {
@@ -2100,10 +2259,8 @@ Function Set-LayoutFromGui {
         Set-Status "Erreur : $($_.Exception.Message)" "Error"
     }
 
-    Update-DisplayInfo
-    $script:DetectedDevice = Get-DetectedDevice
-    Build-Cards
-    Update-Preview
+    # Le message d'application reste affiché, même si le poste reconnu a changé
+    Invoke-DisplayRefresh -Force -Quiet
 }
 
 # ========== ÉVÉNEMENTS ==========
@@ -2145,9 +2302,29 @@ $window.Add_SourceInitialized({
     }
 })
 
+# Surveillance des écrans toutes les 2 secondes (branchement, débranchement, portable ouvert ou fermé)
+$script:DisplayWatcher = [System.Windows.Threading.DispatcherTimer]::new()
+$script:DisplayWatcher.Interval = [System.TimeSpan]::FromSeconds(2)
+$script:DisplayWatcher.Add_Tick({
+    # Pas de rafraîchissement pendant l'application d'une configuration
+    If (-not $btnApply.IsEnabled) { return }
+    Try { Invoke-DisplayRefresh } Catch { Write-Warning "Suivi des écrans : $($_.Exception.Message)" }
+})
+
 $window.Add_ContentRendered({
     Build-Cards
     Update-Preview
+    $script:DisplayWatcher.Start()
+})
+
+# Retour sur la fenêtre : vérification immédiate, sans attendre le prochain cycle
+$window.Add_Activated({
+    If (-not $btnApply.IsEnabled) { return }
+    Try { Invoke-DisplayRefresh } Catch { Write-Warning "Suivi des écrans : $($_.Exception.Message)" }
+})
+
+$window.Add_Closed({
+    $script:DisplayWatcher.Stop()
 })
 
 # ========== AFFICHER LA FENÊTRE ==========
