@@ -8,7 +8,7 @@ Add-Type -AssemblyName WindowsBase
 
 # ========== INTÉGRATION DE DisplayApi ==========
 $displayApiType = ([System.Management.Automation.PSTypeName]'DisplayApi').Type
-If ($displayApiType -and (-not $displayApiType.GetField('Version') -or $displayApiType.GetField('Version').GetValue($null) -lt 4)) {
+If ($displayApiType -and (-not $displayApiType.GetField('Version') -or $displayApiType.GetField('Version').GetValue($null) -lt 5)) {
     # Un type déjà compilé ne peut pas être remplacé dans la même session PowerShell
     throw "Une ancienne version de DisplayApi est déjà chargée dans cette session PowerShell. Fermez-la puis relancez le script."
 }
@@ -23,7 +23,7 @@ public struct POINTL { public int x; public int y; }
 
 public static class DisplayApi
 {
-    public const int Version = 4;
+    public const int Version = 5;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct LUID { public uint LowPart; public int HighPart; }
@@ -268,9 +268,16 @@ public static class DisplayApi
         public EdidInfo Edid;
         // Résolution native du moniteur (celle "recommandée" par Windows), 0 si inconnue
         public int PreferredWidth, PreferredHeight;
+        // Type de connexion (DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY)
+        public uint OutputTechnology;
 
         // Windows place toujours l'écran principal à l'origine du bureau
         public bool IsPrimary { get { return X == 0 && Y == 0; } }
+
+        // Dalle d'ordinateur portable : connexion interne, LVDS ou DisplayPort / UDI intégré
+        public bool IsInternal {
+            get { return OutputTechnology == 0x80000000 || OutputTechnology == 6 || OutputTechnology == 11 || OutputTechnology == 13; }
+        }
     }
 
     public class ResolutionChange {
@@ -327,6 +334,7 @@ public static class DisplayApi
 
                 var ti = paths[p].targetInfo;
                 info.TargetId = ti.id;
+                info.OutputTechnology = ti.outputTechnology;
 
                 var pref = new DISPLAYCONFIG_TARGET_PREFERRED_MODE();
                 pref.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE;
@@ -943,69 +951,143 @@ Function Set-LayoutLineOut {
     return Apply-LayoutPositions -Positions $positions -Sources $sources -PrimaryIndex $PrimaryIndex -LayoutName "Line-out"
 }
 
-# ========== DONNÉES DES LAYOUTS ==========
-# SourceMap[i] = index (dans [DisplayApi]::GetSources()) de l'écran placé dans l'emplacement i ; Screens[i].Id = SourceMap[i] + 1
-# X / Y / W / H : modèle d'aperçu utilisé tant que les écrans ne sont pas tous détectés
-$script:Layouts = @(
+# ========== RÔLES DES ÉCRANS ==========
+# Écran du portable : la dalle interne ; à défaut (aucune dalle interne), le plus petit écran
+Function Find-LaptopScreen {
+    param($Sources)
+
+    $internal = @($Sources | Where-Object { $_.IsInternal })
+    if ($internal.Count -gt 0) { return $internal[0] }
+
+    $withSize = @($Sources | Where-Object { $_.Edid -and $_.Edid.DiagonalInches -gt 0 })
+    if ($withSize.Count -eq @($Sources).Count) {
+        return ($Sources | Sort-Object { $_.Edid.DiagonalInches } | Select-Object -First 1)
+    }
+    return ($Sources | Sort-Object { $_.Width * $_.Height } | Select-Object -First 1)
+}
+
+# L = écran du portable, M1 / M2 = écrans externes de gauche à droite (ordre des Id, inversable)
+Function Get-ScreenRoles {
+    param(
+        $Sources,
+        [bool]$WithLaptop = $true,
+        [bool]$SwapExternal = $false
+    )
+
+    $all = @($Sources)
+    $laptop = $null
+    if ($WithLaptop -and $all.Count -ge 2) { $laptop = Find-LaptopScreen -Sources $all }
+
+    if ($laptop) {
+        $externals = @($all | Where-Object { $_.Key -ne $laptop.Key })
+    } else {
+        # Sans portable (fermé) : écrans externes d'abord, dalle interne éventuelle en dernier
+        $externals = @($all | Where-Object { -not $_.IsInternal }) + @($all | Where-Object { $_.IsInternal })
+    }
+    if ($SwapExternal -and $externals.Count -ge 2) {
+        $tmp = $externals[0]; $externals[0] = $externals[1]; $externals[1] = $tmp
+    }
+
+    return @{
+        L  = $laptop
+        M1 = $(if ($externals.Count -gt 0) { $externals[0] } else { $null })
+        M2 = $(if ($externals.Count -gt 1) { $externals[1] } else { $null })
+    }
+}
+
+# Applique une configuration : mode étendu, résolution maximale éventuelle, placement et écran principal
+Function Invoke-ScreenConfiguration {
+    param(
+        $Config,
+        [switch]$MaxResolution,
+        [switch]$SwapExternal
+    )
+
+    try {
+        $sources = @(Wait-ExtendedDesktop -MinScreens $Config.MinScreens)
+    } catch {
+        $hint = if ($Config.MinScreens -ge 3) { "ouvrez l'ordinateur portable et vérifiez les branchements" } else { "vérifiez les branchements" }
+        throw "La configuration $($Config.Name) demande au moins $($Config.MinScreens) écrans actifs : $hint."
+    }
+    if ($MaxResolution) { $sources = @(Set-MaxResolution -MinScreens $Config.MinScreens) }
+
+    # Portable fermé : seuls les deux écrans externes sont actifs
+    $plan = $Config
+    $withLaptop = $true
+    if ($sources.Count -lt $Config.Slots.Count) {
+        if (-not $Config.Fallback) { throw "La configuration $($Config.Name) demande $($Config.Slots.Count) écrans actifs, $($sources.Count) détecté(s)." }
+        $plan = $Config.Fallback
+        $withLaptop = $false
+    }
+
+    $roles = Get-ScreenRoles -Sources $sources -WithLaptop $withLaptop -SwapExternal ([bool]$SwapExternal)
+    $slots = New-Object object[] $plan.Slots.Count
+    for ($i = 0; $i -lt $plan.Slots.Count; $i++) {
+        $slots[$i] = $roles[$plan.Slots[$i]]
+        if (-not $slots[$i]) { throw "Impossible d'attribuer les écrans de la configuration $($Config.Name)." }
+    }
+
+    $geometry = Get-LayoutGeometry -LayoutKey $plan.Geometry -Slots $slots
+    $positions = [ordered]@{}
+    for ($i = 0; $i -lt $slots.Count; $i++) { $positions[$slots[$i].Key] = $geometry[$i] }
+
+    $primaryKey = $roles[$plan.Primary].Key
+    $primaryIndex = 0
+    for ($i = 0; $i -lt $sources.Count; $i++) {
+        if ($sources[$i].Key -eq $primaryKey) { $primaryIndex = $i; break }
+    }
+
+    return Apply-LayoutPositions -Positions $positions -Sources $sources -PrimaryIndex $primaryIndex -LayoutName $Config.Name
+}
+
+# ========== CONFIGURATIONS ==========
+# Slots : rôles placés dans chaque emplacement de la géométrie (L = portable, M1 / M2 = écrans externes)
+# Primary : rôle de l'écran principal ; Fallback : disposition utilisée quand le portable est fermé
+$script:Configs = @(
     @{
-        Name        = "T-shape"
-        Description = "Deux écrans en haut, un centré en dessous"
-        LayoutKey   = "T"
-        Favorite    = $true
-        SourceMap   = @(1, 2, 0)
-        Screens     = @(
-            @{ Id = 2; X = 0;   Y = 0;   W = 140; H = 90; Primary = $false }
-            @{ Id = 3; X = 140; Y = 0;   W = 140; H = 90; Primary = $false }
-            @{ Id = 1; X = 70;  Y = 90;  W = 140; H = 90; Primary = $true  }
-        )
+        Key = "TOpen"; Name = "T ouvert"; Image = "t-ouvert.png"; Favorite = $true
+        Description = "Portable ouvert sous les deux écrans"
+        PrimaryLabel = "l'écran du portable"
+        Geometry = "T"; Slots = @("M1", "M2", "L"); Primary = "L"; MinScreens = 3
     },
     @{
-        Name        = "Full line"
-        Description = "Tous les écrans alignés côte à côte"
-        LayoutKey   = "Horizontal"
-        Favorite    = $false
-        SourceMap   = @(0, 1, 2)
-        Screens     = @(
-            @{ Id = 1; X = 0;   Y = 0; W = 120; H = 90; Primary = $false }
-            @{ Id = 2; X = 120; Y = 0; W = 120; H = 90; Primary = $false }
-            @{ Id = 3; X = 240; Y = 0; W = 120; H = 90; Primary = $true  }
-        )
+        Key = "LineRightClosed"; Name = "Ligne D fermé"; Image = "ligne-d-ferme.png"; Favorite = $false
+        Description = "Portable fermé à droite des deux écrans"
+        PrimaryLabel = "l'écran externe de gauche"
+        Geometry = "LineOut"; Slots = @("M1", "M2", "L"); Primary = "M1"; MinScreens = 2
+        Fallback = @{ Geometry = "Horizontal"; Slots = @("M1", "M2"); Primary = "M1" }
     },
     @{
-        Name        = "Line-out"
-        Description = "Deux écrans côte à côte, un plus petit à droite"
-        LayoutKey   = "LineOut"
-        Favorite    = $false
-        SourceMap   = @(0, 1, 2)
-        Screens     = @(
-            @{ Id = 1; X = 0;   Y = 0;  W = 140; H = 90; Primary = $true  }
-            @{ Id = 2; X = 140; Y = 0;  W = 140; H = 90; Primary = $false }
-            @{ Id = 3; X = 280; Y = 30; W = 80;  H = 60; Primary = $false }
-        )
+        Key = "LineRightOpen"; Name = "Ligne D ouvert"; Image = "ligne-d-ouvert.png"; Favorite = $false
+        Description = "Portable ouvert à droite des deux écrans"
+        PrimaryLabel = "l'écran du portable"
+        Geometry = "Horizontal"; Slots = @("M1", "M2", "L"); Primary = "L"; MinScreens = 3
+    },
+    @{
+        Key = "LineLeftOpen"; Name = "Ligne G ouvert"; Image = "ligne-g-ouvert.png"; Favorite = $false
+        Description = "Portable ouvert à gauche des deux écrans"
+        PrimaryLabel = "l'écran du portable"
+        Geometry = "Horizontal"; Slots = @("L", "M1", "M2"); Primary = "L"; MinScreens = 3
     }
 )
 
-# ========== PRÉFÉRENCES (favoris, échanges, écran principal, résolution maximale) ==========
+$script:AppRoot = If ($PSScriptRoot) { $PSScriptRoot } Else { (Get-Location).Path }
+$script:ImageDir = Join-Path $script:AppRoot "images"
+
+# ========== PRÉFÉRENCES (favoris, résolution maximale, inversion des écrans externes) ==========
 $script:SettingsPath = Join-Path $env:APPDATA "ScreenConfig\settings.json"
 $script:UseMaxResolution = $true
+$script:SwapExternal = $false
 
 Function Save-Settings {
     Try {
-        $saved = @(ForEach ($layout In $script:Layouts) {
-            $primarySlot = -1
-            For ($i = 0; $i -lt $layout.Screens.Count; $i++) {
-                If ($layout.Screens[$i].Primary) { $primarySlot = $i; break }
-            }
-            @{
-                LayoutKey   = $layout.LayoutKey
-                Favorite    = [bool]$layout.Favorite
-                SourceMap   = @($layout.SourceMap)
-                PrimarySlot = $primarySlot
-            }
-        })
+        $data = @{
+            Favorites     = @($script:Configs | Where-Object { $_.Favorite } | ForEach-Object { $_.Key })
+            MaxResolution = [bool]$script:UseMaxResolution
+            SwapExternal  = [bool]$script:SwapExternal
+        }
         $dir = Split-Path -Parent $script:SettingsPath
         If (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $data = @{ Layouts = $saved; MaxResolution = [bool]$script:UseMaxResolution }
         [System.IO.File]::WriteAllText($script:SettingsPath, ($data | ConvertTo-Json -Depth 5), [System.Text.Encoding]::UTF8)
     }
     Catch {
@@ -1018,28 +1100,18 @@ Function Import-Settings {
     Try {
         $data = [System.IO.File]::ReadAllText($script:SettingsPath) | ConvertFrom-Json
         If ($null -ne $data.MaxResolution) { $script:UseMaxResolution = [bool]$data.MaxResolution }
+        If ($null -ne $data.SwapExternal) { $script:SwapExternal = [bool]$data.SwapExternal }
 
-        ForEach ($saved In @($data.Layouts)) {
-            $layout = $script:Layouts | Where-Object { $_.LayoutKey -eq $saved.LayoutKey } | Select-Object -First 1
-            If (-not $layout) { continue }
-
-            $layout.Favorite = [bool]$saved.Favorite
-
-            # Le SourceMap enregistré doit être une permutation de celui d'origine
-            $count = $layout.SourceMap.Count
-            $map = @($saved.SourceMap | ForEach-Object { [int]$_ })
-            $expected = (@($layout.SourceMap | Sort-Object) -join ',')
-            If ($map.Count -ne $count -or (@($map | Sort-Object) -join ',') -ne $expected) { continue }
-
-            For ($i = 0; $i -lt $count; $i++) {
-                $layout.SourceMap[$i] = $map[$i]
-                $layout.Screens[$i].Id = $map[$i] + 1
-            }
-            $primarySlot = [int]$saved.PrimarySlot
-            If ($primarySlot -ge 0 -and $primarySlot -lt $count) {
-                For ($i = 0; $i -lt $count; $i++) { $layout.Screens[$i].Primary = ($i -eq $primarySlot) }
-            }
+        If ($null -ne $data.Favorites) {
+            $favorites = @($data.Favorites)
+        } ElseIf ($null -ne $data.Layouts) {
+            # Ancien format : favoris des dispositions T-shape / Line-out / Full line
+            $oldToNew = @{ T = "TOpen"; LineOut = "LineRightClosed"; Horizontal = "LineRightOpen" }
+            $favorites = @($data.Layouts | Where-Object { $_.Favorite -and $oldToNew.ContainsKey([string]$_.LayoutKey) } | ForEach-Object { $oldToNew[[string]$_.LayoutKey] })
+        } Else {
+            return
         }
+        ForEach ($config In $script:Configs) { $config.Favorite = ($favorites -contains $config.Key) }
     }
     Catch {
         Write-Warning "Préférences ignorées : $($_.Exception.Message)"
@@ -1048,34 +1120,24 @@ Function Import-Settings {
 
 Import-Settings
 
-# Index du layout sélectionné (par défaut : le premier favoris)
+# Configuration sélectionnée (par défaut : la première favorite)
 $script:SelectedLayoutIndex = 0
-for ($i = 0; $i -lt $script:Layouts.Count; $i++) {
-    if ($script:Layouts[$i].Favorite) {
+for ($i = 0; $i -lt $script:Configs.Count; $i++) {
+    if ($script:Configs[$i].Favorite) {
         $script:SelectedLayoutIndex = $i
         break
     }
 }
 $script:ShowFavoritesOnly = $false
-$script:SelectedSwapIndex = -1
 $script:LastLayoutWarning = $null
 $script:LastResolutionChanges = @()
 
 # ========== ÉCRANS CONNECTÉS ==========
 $script:Displays = @()
-$script:MaxModes = @{}
 
 Function Update-DisplayInfo {
     Try { $list = [DisplayApi]::GetSources() } Catch { $list = $null }
     $script:Displays = @(If ($list) { $list })
-
-    # Résolution maximale prévue pour chaque écran (lecture seule)
-    $script:MaxModes = @{}
-    Try {
-        ForEach ($change In @([DisplayApi]::GetMaxResolutionPlan())) {
-            If ($change) { $script:MaxModes[$change.GdiDeviceName] = $change }
-        }
-    } Catch { }
 }
 
 Function Get-DisplayName {
@@ -1090,65 +1152,13 @@ Function Get-DisplayName {
     return $name
 }
 
-# Taille que l'écran aura une fois la configuration appliquée
-Function Get-DisplayTargetSize {
-    param([int]$Index)
-
-    $d = $script:Displays[$Index]
-    $width = $d.Width; $height = $d.Height
-    If ($script:UseMaxResolution -and $script:MaxModes.ContainsKey($d.GdiDeviceName)) {
-        $width = $script:MaxModes[$d.GdiDeviceName].NewWidth
-        $height = $script:MaxModes[$d.GdiDeviceName].NewHeight
-    }
-    return [pscustomobject]@{ Width = $width; Height = $height }
-}
-
-# "1920 × 1080", ou "1920 × 1080 → 2560 × 1440" si la résolution maximale va la changer
-Function Get-DisplayResolutionText {
-    param([int]$Index)
-
-    If ($Index -lt 0 -or $Index -ge $script:Displays.Count) { return "" }
-    $d = $script:Displays[$Index]
-    $target = Get-DisplayTargetSize -Index $Index
-    $text = "$($d.Width) × $($d.Height)"
-    If ($target.Width -ne $d.Width -or $target.Height -ne $d.Height) { $text += " → $($target.Width) × $($target.Height)" }
-    return $text
-}
-
-# Nom + résolution de l'écran d'index $Index (même numérotation que les layouts : Id = index + 1)
+# Nom + résolution de l'écran d'index $Index
 Function Get-DisplayLabel {
     param([int]$Index)
 
     If ($Index -lt 0 -or $Index -ge $script:Displays.Count) { return "Non détecté" }
     $d = $script:Displays[$Index]
     return "$(Get-DisplayName -Index $Index)`n$($d.Width) × $($d.Height)"
-}
-
-# Écrans à dessiner pour un layout : vraies proportions si tous ses écrans sont connectés, sinon le modèle
-Function Get-PreviewScreens {
-    param($Layout)
-
-    $sizes = @()
-    ForEach ($sourceIdx In $Layout.SourceMap) {
-        If ($sourceIdx -ge $script:Displays.Count) { $sizes = $null; break }
-        $sizes += Get-DisplayTargetSize -Index $sourceIdx
-    }
-
-    $screens = @()
-    If ($sizes) {
-        $geometry = Get-LayoutGeometry -LayoutKey $Layout.LayoutKey -Slots $sizes
-        For ($i = 0; $i -lt $Layout.Screens.Count; $i++) {
-            $screens += @{
-                Id = $Layout.Screens[$i].Id; Primary = $Layout.Screens[$i].Primary
-                X = $geometry[$i][0]; Y = $geometry[$i][1]; W = $sizes[$i].Width; H = $sizes[$i].Height
-            }
-        }
-    } Else {
-        ForEach ($s In $Layout.Screens) {
-            $screens += @{ Id = $s.Id; Primary = $s.Primary; X = $s.X; Y = $s.Y; W = $s.W; H = $s.H }
-        }
-    }
-    return , $screens
 }
 
 Update-DisplayInfo
@@ -1180,6 +1190,7 @@ Try { $script:UseMica = ([int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Window
 
 $accentPalette = Get-AccentPalette
 # Couleurs Fluent de Windows 11 ; les surfaces sont translucides pour laisser passer le fond Mica
+# Illustration : fond clair dans les deux thèmes, les images étant dessinées en noir sur fond transparent
 If ($script:IsDark) {
     $accent = $accentPalette[1]
     $C = @{
@@ -1187,7 +1198,7 @@ If ($script:IsDark) {
         Card = '#0DFFFFFF'; CardHover = '#15FFFFFF'; CardBorder = '#19000000'; Footer = '#0DFFFFFF'
         ControlFill = '#0FFFFFFF'; ControlHover = '#15FFFFFF'; ControlPressed = '#08FFFFFF'; ControlStroke = '#17FFFFFF'
         Subtle = '#0FFFFFFF'; SubtlePressed = '#0AFFFFFF'; Flyout = '#2C2C2C'
-        PreviewBg = '#26000000'; TileFill = '#3F3F3F'; TileStroke = '#26FFFFFF'
+        Illustration = '#E9E9E9'
         AccentText = '#000000'
         InfoBg = '#08FFFFFF'; SuccessBg = '#393D1B'; SuccessFg = '#6CCB5F'
         WarningBg = '#433519'; WarningFg = '#FCE100'; ErrorBg = '#442726'; ErrorFg = '#FF99A4'
@@ -1199,7 +1210,7 @@ If ($script:IsDark) {
         Card = '#B3FFFFFF'; CardHover = '#80F9F9F9'; CardBorder = '#0F000000'; Footer = '#B3FFFFFF'
         ControlFill = '#B3FFFFFF'; ControlHover = '#80F9F9F9'; ControlPressed = '#4DF9F9F9'; ControlStroke = '#1A000000'
         Subtle = '#0A000000'; SubtlePressed = '#06000000'; Flyout = '#F9F9F9'
-        PreviewBg = '#0A000000'; TileFill = '#FFFFFF'; TileStroke = '#33000000'
+        Illustration = '#FFFFFF'
         AccentText = '#FFFFFF'
         InfoBg = '#80F6F6F6'; SuccessBg = '#DFF6DD'; SuccessFg = '#0F7B0F'
         WarningBg = '#FFF4CE'; WarningFg = '#9D5D00'; ErrorBg = '#FDE7E9'; ErrorFg = '#C42B1C'
@@ -1225,7 +1236,7 @@ Function New-Brush {
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     Title="Configuration des écrans"
-    Width="980" Height="860"
+    Width="1000" Height="860"
     MinWidth="720" MinHeight="560"
     WindowStartupLocation="CenterScreen"
     Background="$($C.Bg)" Foreground="$($C.Text)"
@@ -1329,7 +1340,7 @@ Function New-Brush {
             </Style.Triggers>
         </Style>
 
-        <!-- Bouton bascule en forme de pastille (filtre favoris, choix de l'écran principal) -->
+        <!-- Bouton bascule en forme de pastille (filtre favoris) -->
         <Style x:Key="Chip" TargetType="ToggleButton">
             <Setter Property="Foreground" Value="$($C.Text)"/>
             <Setter Property="Background" Value="$($C.ControlFill)"/>
@@ -1441,38 +1452,36 @@ Function New-Brush {
         <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Focusable="False">
             <StackPanel Margin="40,28,40,28">
                 <TextBlock Text="Configuration des écrans" FontFamily="Segoe UI Variable Display, Segoe UI" FontSize="28" FontWeight="SemiBold"/>
-                <TextBlock Text="Choisissez une disposition, réorganisez vos écrans si besoin, puis cliquez sur Appliquer."
+                <TextBlock Text="Choisissez la configuration qui correspond à votre bureau, puis cliquez sur Appliquer."
                            Foreground="$($C.TextSecondary)" Margin="0,4,0,0" TextWrapping="Wrap"/>
 
-                <!-- Aperçu de la disposition -->
+                <!-- Configuration sélectionnée -->
                 <TextBlock x:Name="txtPreviewTitle" Style="{StaticResource SectionTitle}" Text="Aperçu"/>
                 <Border Style="{StaticResource Card}">
                     <Grid>
                         <Grid.RowDefinitions>
-                            <RowDefinition Height="280"/>
+                            <RowDefinition Height="270"/>
                             <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
-                        <Border Background="$($C.PreviewBg)" CornerRadius="5,5,0,0">
-                            <Canvas x:Name="cvPreview" ClipToBounds="True" Background="Transparent"/>
-                        </Border>
+                        <Border x:Name="bdPreview" Background="$($C.Illustration)" CornerRadius="5,5,0,0" Padding="32,24"/>
                         <Grid Grid.Row="1" Margin="16,12,16,12">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="Auto"/>
                                 <ColumnDefinition Width="*"/>
-                                <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
-                            <TextBlock Style="{StaticResource Icon}" Text="&#xE946;" Foreground="$($C.TextSecondary)" Margin="0,0,10,0"/>
-                            <TextBlock x:Name="txtHint" Grid.Column="1" Foreground="$($C.TextSecondary)" FontSize="12"
-                                       TextWrapping="Wrap" VerticalAlignment="Center"/>
-                            <Button x:Name="btnIdentify" Grid.Column="2" Style="{StaticResource BtnStandard}" Content="Identifier" Margin="16,0,0,0"/>
+                            <TextBlock x:Name="txtPreviewIcon" Style="{StaticResource Icon}" Text="&#xE80F;" FontSize="20" Margin="4,0,16,0"/>
+                            <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                <TextBlock x:Name="txtPrimaryInfo" TextWrapping="Wrap"/>
+                                <TextBlock x:Name="txtDetect" FontSize="12" Foreground="$($C.TextSecondary)" TextWrapping="Wrap"/>
+                            </StackPanel>
                         </Grid>
                     </Grid>
                 </Border>
 
-                <!-- Choix de la disposition -->
+                <!-- Choix de la configuration -->
                 <Grid Margin="0,28,0,8">
-                    <TextBlock Text="Disposition" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                    <ToggleButton x:Name="tglFavorites" Style="{StaticResource Chip}" HorizontalAlignment="Right" ToolTip="N'afficher que les dispositions favorites">
+                    <TextBlock Text="Configurations" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                    <ToggleButton x:Name="tglFavorites" Style="{StaticResource Chip}" HorizontalAlignment="Right" ToolTip="N'afficher que les configurations favorites">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Style="{StaticResource Icon}" Text="&#xE734;" FontSize="12" Margin="0,0,8,0"/>
                             <TextBlock Text="Favoris uniquement" FontSize="13" VerticalAlignment="Center"/>
@@ -1481,27 +1490,11 @@ Function New-Brush {
                 </Grid>
                 <WrapPanel x:Name="pnlCards" Margin="-4,0,-4,0"/>
                 <TextBlock x:Name="txtNoFavorites" Visibility="Collapsed" Foreground="$($C.TextSecondary)" Margin="0,4,0,0" TextWrapping="Wrap"
-                           Text="Aucune disposition favorite. Cliquez sur l'étoile d'une disposition pour l'ajouter aux favoris."/>
+                           Text="Aucune configuration favorite. Cliquez sur l'étoile d'une configuration pour l'ajouter aux favoris."/>
 
                 <!-- Paramètres -->
                 <TextBlock Style="{StaticResource SectionTitle}" Text="Paramètres"/>
                 <Border Style="{StaticResource Card}" Padding="16,12" MinHeight="68" Margin="0,0,0,4">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Style="{StaticResource Icon}" Text="&#xE7F4;" FontSize="20" Margin="4,0,20,0"/>
-                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                            <TextBlock Text="Écran principal"/>
-                            <TextBlock Text="La barre des tâches et les nouvelles fenêtres s'affichent sur cet écran."
-                                       FontSize="12" Foreground="$($C.TextSecondary)" TextWrapping="Wrap"/>
-                        </StackPanel>
-                        <StackPanel x:Name="pnlPrimary" Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0"/>
-                    </Grid>
-                </Border>
-                <Border Style="{StaticResource Card}" Padding="16,12" MinHeight="68">
                     <Grid>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto"/>
@@ -1515,6 +1508,22 @@ Function New-Brush {
                                        FontSize="12" Foreground="$($C.TextSecondary)" TextWrapping="Wrap"/>
                         </StackPanel>
                         <CheckBox x:Name="chkMaxRes" Grid.Column="2" Style="{StaticResource ToggleSwitch}" VerticalAlignment="Center" Margin="16,0,0,0"/>
+                    </Grid>
+                </Border>
+                <Border Style="{StaticResource Card}" Padding="16,12" MinHeight="68">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Style="{StaticResource Icon}" Text="&#xE8AB;" FontSize="20" Margin="4,0,20,0"/>
+                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                            <TextBlock Text="Inverser les écrans externes"/>
+                            <TextBlock Text="À activer si la souris ne passe pas naturellement d'un écran externe à l'autre après l'application."
+                                       FontSize="12" Foreground="$($C.TextSecondary)" TextWrapping="Wrap"/>
+                        </StackPanel>
+                        <CheckBox x:Name="chkSwapExternal" Grid.Column="2" Style="{StaticResource ToggleSwitch}" VerticalAlignment="Center" Margin="16,0,0,0"/>
                     </Grid>
                 </Border>
             </StackPanel>
@@ -1551,18 +1560,19 @@ $window = [System.Windows.Markup.XamlReader]::Load($reader)
 
 # Récupération des éléments XAML
 $pnlCards        = $window.FindName("pnlCards")
-$cvPreview       = $window.FindName("cvPreview")
+$bdPreview       = $window.FindName("bdPreview")
 $btnApply        = $window.FindName("btnApply")
-$btnIdentify     = $window.FindName("btnIdentify")
 $txtStatus       = $window.FindName("txtStatus")
 $txtStatusIcon   = $window.FindName("txtStatusIcon")
 $bdStatus        = $window.FindName("bdStatus")
 $txtPreviewTitle = $window.FindName("txtPreviewTitle")
-$txtHint         = $window.FindName("txtHint")
+$txtPreviewIcon  = $window.FindName("txtPreviewIcon")
+$txtPrimaryInfo  = $window.FindName("txtPrimaryInfo")
+$txtDetect       = $window.FindName("txtDetect")
 $tglFavorites    = $window.FindName("tglFavorites")
 $txtNoFavorites  = $window.FindName("txtNoFavorites")
-$pnlPrimary      = $window.FindName("pnlPrimary")
 $chkMaxRes       = $window.FindName("chkMaxRes")
+$chkSwapExternal = $window.FindName("chkSwapExternal")
 
 # ========== FONCTIONS D'AFFICHAGE ==========
 $script:StatusStyles = @{
@@ -1593,27 +1603,6 @@ Function Set-Status {
     $bdStatus.Visibility = "Visible"
 }
 
-Function New-TextBlock {
-    param(
-        [string]$Text,
-        [string]$Color,
-        [double]$Size = 14,
-        [string]$Weight = "Normal",
-        [string]$Font = ""
-    )
-
-    $tb = [System.Windows.Controls.TextBlock]::new()
-    $tb.Text = $Text
-    $tb.Foreground = New-Brush $Color
-    $tb.FontSize = $Size
-    $tb.FontWeight = $Weight
-    If ($Font) { $tb.FontFamily = [System.Windows.Media.FontFamily]::new($Font) }
-    $tb.HorizontalAlignment = "Center"
-    $tb.TextAlignment = "Center"
-    $tb.TextTrimming = "CharacterEllipsis"
-    return $tb
-}
-
 # Icône de fenêtre dessinée à partir d'un glyphe Windows (aucun fichier externe)
 Function New-GlyphImage {
     param([string]$Glyph, [string]$Color, [int]$Size = 64)
@@ -1638,325 +1627,76 @@ Function New-GlyphImage {
     return $bitmap
 }
 
-Function Swap-ScreenSlots {
-    param([int]$IndexA, [int]$IndexB)
-    $layout = $script:Layouts[$script:SelectedLayoutIndex]
-    $screens = $layout.Screens
+# Image d'une configuration (dossier images\ à côté du script), chargée une seule fois ; $null si absente
+$script:ImageCache = @{}
+Function Get-ConfigImage {
+    param($Config)
 
-    $tmpId = $screens[$IndexA].Id
-    $screens[$IndexA].Id = $screens[$IndexB].Id
-    $screens[$IndexB].Id = $tmpId
-
-    $tmpPrimary = $screens[$IndexA].Primary
-    $screens[$IndexA].Primary = $screens[$IndexB].Primary
-    $screens[$IndexB].Primary = $tmpPrimary
-
-    $tmpSrc = $layout.SourceMap[$IndexA]
-    $layout.SourceMap[$IndexA] = $layout.SourceMap[$IndexB]
-    $layout.SourceMap[$IndexB] = $tmpSrc
-}
-
-Function Invoke-ScreenSwap {
-    param([int]$IndexA, [int]$IndexB)
-
-    $layout = $script:Layouts[$script:SelectedLayoutIndex]
-    $idA = $layout.Screens[$IndexA].Id
-    $idB = $layout.Screens[$IndexB].Id
-    Swap-ScreenSlots -IndexA $IndexA -IndexB $IndexB
-    $script:SelectedSwapIndex = -1
-    Save-Settings
-    Set-Status "Écrans $idA et $idB échangés. Cliquez sur Appliquer pour valider." "Success"
-    Update-Preview
-    Build-Cards
-}
-
-Function Set-PrimaryScreen {
-    param([int]$ScreenId)
-
-    $layout = $script:Layouts[$script:SelectedLayoutIndex]
-    ForEach ($s In $layout.Screens) {
-        $s.Primary = ($s.Id -eq $ScreenId)
-    }
-    Save-Settings
-    Set-Status "Écran $ScreenId défini comme écran principal. Cliquez sur Appliquer pour valider." "Info"
-    Update-Preview
-    Build-Cards
-}
-
-# Clic simple sur un écran de l'aperçu : sélection, puis échange avec le deuxième écran cliqué
-Function Invoke-TileClick {
-    param([int]$Index)
-
-    If ($script:SelectedSwapIndex -lt 0) {
-        $script:SelectedSwapIndex = $Index
-        $selId = $script:Layouts[$script:SelectedLayoutIndex].Screens[$Index].Id
-        Set-Status ([string]::Format("Écran {0} sélectionné. Cliquez sur un autre écran pour les échanger.", $selId)) "Info"
-        Update-Preview
-    } ElseIf ($script:SelectedSwapIndex -eq $Index) {
-        $script:SelectedSwapIndex = -1
-        Set-Status "" "None"
-        Update-Preview
-    } Else {
-        Invoke-ScreenSwap -IndexA $script:SelectedSwapIndex -IndexB $Index
-    }
-}
-
-# Emplacement de l'aperçu situé sous le point (en ignorant l'écran en cours de déplacement)
-Function Get-PreviewSlotAt {
-    param([System.Windows.Point]$Point, [int]$Exclude = -1)
-
-    ForEach ($slot In $script:PreviewSlots) {
-        If ($slot.Index -eq $Exclude) { continue }
-        If ($Point.X -ge $slot.X -and $Point.X -le ($slot.X + $slot.W) -and $Point.Y -ge $slot.Y -and $Point.Y -le ($slot.Y + $slot.H)) {
-            return $slot.Index
+    If ($script:ImageCache.ContainsKey($Config.Key)) { return $script:ImageCache[$Config.Key] }
+    $image = $null
+    $path = Join-Path $script:ImageDir $Config.Image
+    If (Test-Path -LiteralPath $path) {
+        Try {
+            $bitmap = [System.Windows.Media.Imaging.BitmapImage]::new()
+            $bitmap.BeginInit()
+            $bitmap.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+            $bitmap.UriSource = [System.Uri]::new($path)
+            $bitmap.EndInit()
+            $bitmap.Freeze()
+            $image = $bitmap
+        } Catch {
+            Write-Warning "Image illisible : $path"
         }
     }
-    return -1
+    $script:ImageCache[$Config.Key] = $image
+    return $image
 }
 
-Function Set-TileHighlight {
-    param([int]$Index, [bool]$On)
+# Visuel d'une configuration ; message de remplacement si l'image est introuvable
+Function New-ConfigVisual {
+    param($Config, [bool]$Large = $false)
 
-    $info = $script:PreviewTiles[$Index]
-    If (-not $info) { return }
-    If ($On) {
-        $info.Tile.BorderBrush = New-Brush $info.Highlight
-        $info.Tile.BorderThickness = [System.Windows.Thickness]::new(3)
-    } Else {
-        $info.Tile.BorderBrush = $info.Stroke
-        $info.Tile.BorderThickness = $info.Thickness
-    }
-}
-
-Function Draw-ScreenRect {
-    param(
-        $Canvas,
-        [double]$X, [double]$Y, [double]$W, [double]$H,
-        $Screen,
-        [int]$ScreenIndex = -1,
-        [bool]$Mini = $false
-    )
-
-    $isPrimary = [bool]$Screen.Primary
-    $isSelected = (-not $Mini -and $ScreenIndex -ge 0 -and $ScreenIndex -eq $script:SelectedSwapIndex)
-
-    $fill = If ($isPrimary) { $C.Accent } Else { $C.TileFill }
-    $textColor = If ($isPrimary) { $C.AccentText } Else { $C.Text }
-    $highlight = If ($isPrimary) { $C.Text } Else { $C.Accent }
-    If ($isSelected) {
-        $stroke = $highlight
-    } ElseIf ($isPrimary) {
-        $stroke = $C.Accent
-    } Else {
-        $stroke = $C.TileStroke
+    $source = Get-ConfigImage -Config $Config
+    If ($source) {
+        $img = [System.Windows.Controls.Image]::new()
+        $img.Source = $source
+        $img.Stretch = "Uniform"
+        [System.Windows.Media.RenderOptions]::SetBitmapScalingMode($img, [System.Windows.Media.BitmapScalingMode]::HighQuality)
+        return $img
     }
 
-    $tile = [System.Windows.Controls.Border]::new()
-    $tile.Width  = [Math]::Max($W, 2)
-    $tile.Height = [Math]::Max($H, 2)
-    $tile.Background = New-Brush $fill
-    $tile.BorderBrush = New-Brush $stroke
-    $tile.BorderThickness = [System.Windows.Thickness]::new($(If ($isSelected) { 3 } Else { 1 }))
-    $tile.CornerRadius = [System.Windows.CornerRadius]::new($(If ($Mini) { 2 } Else { 6 }))
-    $tile.SnapsToDevicePixels = $true
-
-    $stack = [System.Windows.Controls.StackPanel]::new()
-    $stack.HorizontalAlignment = "Center"
-    $stack.VerticalAlignment = "Center"
-    $stack.IsHitTestVisible = $false
-
-    If ($Mini) {
-        $numberSize = [Math]::Max([Math]::Min($H * 0.45, 13), 8)
-    } Else {
-        $numberSize = [Math]::Max([Math]::Min($H / 3.5, 40), 14)
-    }
-    $stack.Children.Add((New-TextBlock -Text "$($Screen.Id)" -Color $textColor -Size $numberSize -Weight "SemiBold" -Font "Segoe UI Variable Display, Segoe UI")) | Out-Null
-
-    # Nom, résolution et rôle de l'écran quand la place le permet
-    If (-not $Mini -and $H -ge 90 -and $W -ge 110) {
-        $maxTextWidth = [Math]::Max($W - 16, 0)
-        $name = New-TextBlock -Text (Get-DisplayName -Index ($Screen.Id - 1)) -Color $textColor -Size 12
-        $name.MaxWidth = $maxTextWidth
-        $stack.Children.Add($name) | Out-Null
-
-        $resolution = Get-DisplayResolutionText -Index ($Screen.Id - 1)
-        If ($resolution) {
-            $res = New-TextBlock -Text $resolution -Color $textColor -Size 12
-            $res.Opacity = 0.8
-            $res.MaxWidth = $maxTextWidth
-            $stack.Children.Add($res) | Out-Null
-        }
-        If ($isPrimary -and $H -ge 125) {
-            $role = New-TextBlock -Text "Écran principal" -Color $textColor -Size 11 -Weight "SemiBold"
-            $role.Margin = [System.Windows.Thickness]::new(0, 6, 0, 0)
-            $stack.Children.Add($role) | Out-Null
-        }
-    }
-    $tile.Child = $stack
-
-    If (-not $Mini) {
-        $tile.Cursor = [System.Windows.Input.Cursors]::Hand
-        $tile.Tag = $ScreenIndex
-        $tile.ToolTip = "Écran $($Screen.Id) · $(Get-DisplayName -Index ($Screen.Id - 1))`nGlissez-le sur un autre écran pour les échanger.`nClic droit pour en faire l'écran principal."
-
-        $ctxMenu = [System.Windows.Controls.ContextMenu]::new()
-        $miPrimary = [System.Windows.Controls.MenuItem]::new()
-        $miPrimary.Header = "Définir comme écran principal"
-        $miPrimary.IsEnabled = -not $isPrimary
-        $miPrimary.Tag = $Screen.Id
-        $miPrimary.Add_Click({
-            param($sender, $e)
-            Set-PrimaryScreen -ScreenId $sender.Tag
-        })
-        $ctxMenu.Items.Add($miPrimary) | Out-Null
-        $ctxMenu.Items.Add([System.Windows.Controls.Separator]::new()) | Out-Null
-        $miIdentify = [System.Windows.Controls.MenuItem]::new()
-        $miIdentify.Header = "Identifier les écrans"
-        $miIdentify.Add_Click({ Show-IdentifyOverlays })
-        $ctxMenu.Items.Add($miIdentify) | Out-Null
-        $tile.ContextMenu = $ctxMenu
-
-        # Glisser-déposer : un écran lâché sur un autre échange leurs emplacements ; un simple clic garde l'ancien fonctionnement
-        $tile.Add_MouseLeftButtonDown({
-            param($sender, $e)
-            $script:Drag = @{ Index = [int]$sender.Tag; Start = $e.GetPosition($cvPreview); Moved = $false; Target = -1 }
-            [void]$sender.CaptureMouse()
-            $e.Handled = $true
-        })
-        $tile.Add_MouseMove({
-            param($sender, $e)
-            $drag = $script:Drag
-            If (-not $drag -or $drag.Index -ne [int]$sender.Tag) { return }
-            $p = $e.GetPosition($cvPreview)
-            $dx = $p.X - $drag.Start.X
-            $dy = $p.Y - $drag.Start.Y
-            If (-not $drag.Moved) {
-                If ([Math]::Abs($dx) -lt 4 -and [Math]::Abs($dy) -lt 4) { return }
-                $drag.Moved = $true
-                [System.Windows.Controls.Panel]::SetZIndex($sender, 100)
-                $sender.Opacity = 0.85
-            }
-            $sender.RenderTransform = [System.Windows.Media.TranslateTransform]::new($dx, $dy)
-            $target = Get-PreviewSlotAt -Point $p -Exclude $drag.Index
-            If ($target -ne $drag.Target) {
-                If ($drag.Target -ge 0) { Set-TileHighlight -Index $drag.Target -On $false }
-                If ($target -ge 0) { Set-TileHighlight -Index $target -On $true }
-                $drag.Target = $target
-            }
-        })
-        $tile.Add_MouseLeftButtonUp({
-            param($sender, $e)
-            $drag = $script:Drag
-            $script:Drag = $null
-            $sender.ReleaseMouseCapture()
-            If (-not $drag) { return }
-            If (-not $drag.Moved) {
-                Invoke-TileClick -Index $drag.Index
-            } ElseIf ($drag.Target -ge 0) {
-                Invoke-ScreenSwap -IndexA $drag.Index -IndexB $drag.Target
-            } Else {
-                Update-Preview
-            }
-        })
-        $tile.Add_LostMouseCapture({
-            # Glisser interrompu (changement de fenêtre, etc.) : on remet l'aperçu en place
-            If ($script:Drag) {
-                $script:Drag = $null
-                Update-Preview
-            }
-        })
-
-        $script:PreviewTiles[$ScreenIndex] = @{
-            Tile = $tile; Stroke = $tile.BorderBrush; Thickness = $tile.BorderThickness; Highlight = $highlight
-        }
-    }
-
-    [System.Windows.Controls.Canvas]::SetLeft($tile, $X)
-    [System.Windows.Controls.Canvas]::SetTop($tile, $Y)
-    $Canvas.Children.Add($tile) | Out-Null
-}
-
-Function Draw-LayoutPreview {
-    param(
-        $Canvas,
-        $Screens,
-        [bool]$Mini = $false
-    )
-
-    $Canvas.Children.Clear()
-    If (-not $Mini) {
-        $script:PreviewSlots = @()
-        $script:PreviewTiles = @{}
-    }
-    If (-not $Screens -or $Screens.Count -eq 0) { return }
-
-    $minX = ($Screens | ForEach-Object { $_.X }) | Measure-Object -Minimum | Select-Object -ExpandProperty Minimum
-    $minY = ($Screens | ForEach-Object { $_.Y }) | Measure-Object -Minimum | Select-Object -ExpandProperty Minimum
-    $maxX = ($Screens | ForEach-Object { $_.X + $_.W }) | Measure-Object -Maximum | Select-Object -ExpandProperty Maximum
-    $maxY = ($Screens | ForEach-Object { $_.Y + $_.H }) | Measure-Object -Maximum | Select-Object -ExpandProperty Maximum
-
-    $rawW = $maxX - $minX
-    $rawH = $maxY - $minY
-
-    $cW = $Canvas.ActualWidth
-    $cH = $Canvas.ActualHeight
-    If ($cW -le 0) { $cW = 400 }
-    If ($cH -le 0) { $cH = 250 }
-
-    $padding = If ($Mini) { 6 } Else { 28 }
-    $availW = $cW - (2 * $padding)
-    $availH = $cH - (2 * $padding)
-
-    If ($rawW -gt 0 -and $rawH -gt 0) {
-        $scale = [Math]::Min($availW / $rawW, $availH / $rawH)
-    } Else {
-        $scale = 1.0
-    }
-
-    $totalW = $rawW * $scale
-    $totalH = $rawH * $scale
-
-    $offsetX = ($cW - $totalW) / 2
-    $offsetY = ($cH - $totalH) / 2
-
-    # Petit espace entre les écrans, comme dans les Paramètres Windows
-    $gap = If ($Mini) { 1.5 } Else { 3 }
-
-    For ($idx = 0; $idx -lt $Screens.Count; $idx++) {
-        $s = $Screens[$idx]
-        $sx = (($s.X - $minX) * $scale) + $offsetX
-        $sy = (($s.Y - $minY) * $scale) + $offsetY
-        $sw = $s.W * $scale
-        $sh = $s.H * $scale
-        Draw-ScreenRect -Canvas $Canvas -X ($sx + $gap) -Y ($sy + $gap) -W ($sw - 2 * $gap) -H ($sh - 2 * $gap) -Screen $s -ScreenIndex $idx -Mini $Mini
-        If (-not $Mini) {
-            $script:PreviewSlots += @{ Index = $idx; X = $sx; Y = $sy; W = $sw; H = $sh }
-        }
-    }
+    $missing = [System.Windows.Controls.TextBlock]::new()
+    $missing.Text = "Image introuvable : images\$($Config.Image)"
+    $missing.Foreground = New-Brush '#5F5F5F'
+    $missing.FontSize = $(If ($Large) { 14 } Else { 11 })
+    $missing.TextWrapping = "Wrap"
+    $missing.TextAlignment = "Center"
+    $missing.HorizontalAlignment = "Center"
+    $missing.VerticalAlignment = "Center"
+    return $missing
 }
 
 Function Switch-Favorite {
     param([int]$LayoutIndex)
 
-    $script:Layouts[$LayoutIndex].Favorite = -not $script:Layouts[$LayoutIndex].Favorite
+    $script:Configs[$LayoutIndex].Favorite = -not $script:Configs[$LayoutIndex].Favorite
     Save-Settings
     Build-Cards
-    Update-Preview
 }
 
 Function Build-Cards {
     $pnlCards.Children.Clear()
 
-    If ($script:ShowFavoritesOnly -and -not $script:Layouts[$script:SelectedLayoutIndex].Favorite) {
-        For ($j = 0; $j -lt $script:Layouts.Count; $j++) {
-            If ($script:Layouts[$j].Favorite) { $script:SelectedLayoutIndex = $j; break }
+    If ($script:ShowFavoritesOnly -and -not $script:Configs[$script:SelectedLayoutIndex].Favorite) {
+        For ($j = 0; $j -lt $script:Configs.Count; $j++) {
+            If ($script:Configs[$j].Favorite) { $script:SelectedLayoutIndex = $j; break }
         }
     }
 
     $shown = 0
-    For ($i = 0; $i -lt $script:Layouts.Count; $i++) {
-        $layout = $script:Layouts[$i]
-        If ($script:ShowFavoritesOnly -and -not $layout.Favorite) { continue }
+    For ($i = 0; $i -lt $script:Configs.Count; $i++) {
+        $config = $script:Configs[$i]
+        If ($script:ShowFavoritesOnly -and -not $config.Favorite) { continue }
         $shown++
         $idx = $i
 
@@ -1964,25 +1704,25 @@ Function Build-Cards {
 
         # Carte sélectionnable : bordure d'accent quand elle est choisie (épaisseur compensée par le padding)
         $card = [System.Windows.Controls.Border]::new()
-        $card.Width = 236
+        $card.Width = 214
         $card.Margin = [System.Windows.Thickness]::new(4)
         $card.CornerRadius = [System.Windows.CornerRadius]::new(6)
         $card.Background = New-Brush $C.Card
         If ($isSelected) {
             $card.BorderBrush = New-Brush $C.Accent
             $card.BorderThickness = [System.Windows.Thickness]::new(2)
-            $card.Padding = [System.Windows.Thickness]::new(11)
+            $card.Padding = [System.Windows.Thickness]::new(9)
         } Else {
             $card.BorderBrush = New-Brush $C.CardBorder
             $card.BorderThickness = [System.Windows.Thickness]::new(1)
-            $card.Padding = [System.Windows.Thickness]::new(12)
+            $card.Padding = [System.Windows.Thickness]::new(10)
         }
         $card.Tag = $idx
-        $card.ToolTip = "Choisir la disposition $($layout.Name)"
+        $card.ToolTip = "Choisir la configuration $($config.Name)"
 
         $ctxMenu = [System.Windows.Controls.ContextMenu]::new()
         $miFav = [System.Windows.Controls.MenuItem]::new()
-        If ($layout.Favorite) {
+        If ($config.Favorite) {
             $miFav.Header = "Retirer des favoris"
         } Else {
             $miFav.Header = "Ajouter aux favoris"
@@ -2001,15 +1741,14 @@ Function Build-Cards {
         $grid.RowDefinitions.Add($row1)
         $grid.RowDefinitions.Add($row2)
 
-        # Miniature
-        $miniHost = [System.Windows.Controls.Border]::new()
-        $miniHost.Height = 104
-        $miniHost.CornerRadius = [System.Windows.CornerRadius]::new(4)
-        $miniHost.Background = New-Brush $C.PreviewBg
-        $miniCanvas = [System.Windows.Controls.Canvas]::new()
-        $miniCanvas.IsHitTestVisible = $false
-        $miniHost.Child = $miniCanvas
-        $grid.Children.Add($miniHost) | Out-Null
+        # Vignette
+        $thumb = [System.Windows.Controls.Border]::new()
+        $thumb.Height = 96
+        $thumb.CornerRadius = [System.Windows.CornerRadius]::new(4)
+        $thumb.Background = New-Brush $C.Illustration
+        $thumb.Padding = [System.Windows.Thickness]::new(8)
+        $thumb.Child = New-ConfigVisual -Config $config
+        $grid.Children.Add($thumb) | Out-Null
 
         # Nom, description et étoile favoris
         $labelRow = [System.Windows.Controls.Grid]::new()
@@ -2024,11 +1763,11 @@ Function Build-Cards {
 
         $texts = [System.Windows.Controls.StackPanel]::new()
         $title = [System.Windows.Controls.TextBlock]::new()
-        $title.Text = $layout.Name
+        $title.Text = $config.Name
         $title.FontWeight = If ($isSelected) { "SemiBold" } Else { "Normal" }
         $texts.Children.Add($title) | Out-Null
         $desc = [System.Windows.Controls.TextBlock]::new()
-        $desc.Text = $layout.Description
+        $desc.Text = $config.Description
         $desc.FontSize = 12
         $desc.Foreground = New-Brush $C.TextSecondary
         $desc.TextWrapping = "Wrap"
@@ -2042,7 +1781,7 @@ Function Build-Cards {
         $starGlyph = [System.Windows.Controls.TextBlock]::new()
         $starGlyph.FontFamily = [System.Windows.Media.FontFamily]::new($script:IconFont)
         $starGlyph.FontSize = 16
-        If ($layout.Favorite) {
+        If ($config.Favorite) {
             $starGlyph.Text = [string][char]0xE735
             $starGlyph.Foreground = New-Brush $C.Accent
             $star.ToolTip = "Retirer des favoris"
@@ -2075,102 +1814,59 @@ Function Build-Cards {
         $card.Add_MouseLeftButtonDown({
             param($sender, $e)
             $script:SelectedLayoutIndex = $sender.Tag
-            $script:SelectedSwapIndex = -1
             Set-Status "" "None"
             Build-Cards
             Update-Preview
         })
 
         $pnlCards.Children.Add($card) | Out-Null
-        $miniCanvas.Tag = Get-PreviewScreens -Layout $layout
-        $miniCanvas.Add_Loaded({
-            param($sender, $e)
-            Draw-LayoutPreview -Canvas $sender -Screens $sender.Tag -Mini $true
-        })
     }
 
     $txtNoFavorites.Visibility = If ($shown -eq 0) { "Visible" } Else { "Collapsed" }
 }
 
-# Pastilles "Écran 1 / 2 / 3" pour choisir l'écran principal
-Function Update-PrimaryChips {
-    $pnlPrimary.Children.Clear()
-    $layout = $script:Layouts[$script:SelectedLayoutIndex]
-    ForEach ($s In @($layout.Screens | Sort-Object { $_.Id })) {
-        $chip = [System.Windows.Controls.RadioButton]::new()
-        $chip.Style = $window.FindResource("Chip")
-        $chip.GroupName = "PrimaryScreen"
-        $chip.Content = "Écran $($s.Id)"
-        $chip.Margin = [System.Windows.Thickness]::new(4, 0, 0, 0)
-        $chip.ToolTip = Get-DisplayLabel -Index ($s.Id - 1)
-        $chip.IsChecked = [bool]$s.Primary
-        $chip.Tag = $s.Id
-        $chip.Add_Checked({
-            param($sender, $e)
-            Set-PrimaryScreen -ScreenId $sender.Tag
-        })
-        $pnlPrimary.Children.Add($chip) | Out-Null
-    }
-}
-
-Function Update-Hint {
-    $layout = $script:Layouts[$script:SelectedLayoutIndex]
-    $needed = $layout.SourceMap.Count
-    If ($script:Displays.Count -lt $needed) {
-        $txtHint.Text = "Aperçu indicatif : cette disposition demande $needed écrans, $($script:Displays.Count) détecté(s) pour le moment."
-    } Else {
-        $txtHint.Text = "Glissez un écran sur un autre pour les échanger. Clic droit sur un écran pour en faire l'écran principal."
-    }
-}
-
+# Grande image de la configuration choisie, écran principal et écrans détectés
 Function Update-Preview {
-    $layout = $script:Layouts[$script:SelectedLayoutIndex]
-    $txtPreviewTitle.Text = "Aperçu : $($layout.Name)"
-    Draw-LayoutPreview -Canvas $cvPreview -Screens (Get-PreviewScreens -Layout $layout) -Mini $false
-    Update-PrimaryChips
-    Update-Hint
+    $config = $script:Configs[$script:SelectedLayoutIndex]
+    $txtPreviewTitle.Text = "Aperçu : $($config.Name)"
+    $bdPreview.Child = New-ConfigVisual -Config $config -Large $true
+    $txtPrimaryInfo.Text = "Écran principal : $($config.PrimaryLabel)"
+
+    $count = $script:Displays.Count
+    $internal = @($script:Displays | Where-Object { $_.IsInternal }).Count
+    $external = $count - $internal
+    If ($count -lt $config.MinScreens) {
+        $txtPreviewIcon.Text = [string][char]0xE7BA
+        $txtPreviewIcon.Foreground = New-Brush $C.WarningFg
+        $hint = If ($config.MinScreens -ge 3) { "Ouvrez l'ordinateur portable et vérifiez les branchements." } Else { "Vérifiez les branchements." }
+        $txtDetect.Text = "Cette configuration demande $($config.MinScreens) écrans actifs, $count détecté(s) pour le moment. $hint"
+    } Else {
+        $txtPreviewIcon.Text = [string][char]0xE80F
+        $txtPreviewIcon.Foreground = New-Brush $C.Text
+        $parts = @()
+        If ($external -gt 0) { $parts += "$external externe(s)" }
+        If ($internal -gt 0) { $parts += "l'écran du portable" }
+        $txtDetect.Text = "$count écran(s) détecté(s) : $($parts -join ' + ')."
+    }
+    $txtDetect.ToolTip = (@(For ($i = 0; $i -lt $count; $i++) { "$($i + 1). $((Get-DisplayLabel -Index $i) -replace "`n", ' · ')" }) -join "`n")
 }
 
 Function Set-LayoutFromGui {
-    $currentLayout = $script:Layouts[$script:SelectedLayoutIndex]
-
-    # Trouver l'index de l'écran principal dans le layout
-    $primaryScreenIdx = 0
-    For ($i = 0; $i -lt $currentLayout.Screens.Count; $i++) {
-        If ($currentLayout.Screens[$i].Primary) { $primaryScreenIdx = $i; break }
-    }
-
-    # Récupérer l'index dans SourceMap pour l'écran principal
-    $primarySourceIdx = $currentLayout.SourceMap[$primaryScreenIdx]
-    $sourceMap = [int[]]$currentLayout.SourceMap
-    $useMax = [bool]$script:UseMaxResolution
+    $config = $script:Configs[$script:SelectedLayoutIndex]
     $script:LastResolutionChanges = @()
 
     Try {
         # Avec la résolution maximale, chaque écran y passe d'abord ; la disposition est calculée avec ces tailles
-        switch ($currentLayout.LayoutKey) {
-            "T" {
-                $result = Set-LayoutTShape -PrimaryIndex $primarySourceIdx -SourceMap $sourceMap -MaxResolution:$useMax
-            }
-            "Horizontal" {
-                $result = Set-LayoutHorizontal -MinScreens 3 -PrimaryIndex $primarySourceIdx -SourceMap $sourceMap -MaxResolution:$useMax
-            }
-            "LineOut" {
-                $result = Set-LayoutLineOut -PrimaryIndex $primarySourceIdx -SourceMap $sourceMap -MaxResolution:$useMax
-            }
-            default {
-                throw "Layout non supporté : $($currentLayout.LayoutKey)"
-            }
-        }
+        $result = Invoke-ScreenConfiguration -Config $config -MaxResolution:([bool]$script:UseMaxResolution) -SwapExternal:([bool]$script:SwapExternal)
 
         $applied = @($result)
         $resolutionChanged = @($script:LastResolutionChanges | Where-Object { $_.Changed }).Count
         $resolutionFailed  = @($script:LastResolutionChanges | Where-Object { $_.NeedsChange -and -not $_.Changed }).Count
 
         If ($applied.Count -eq 0 -or $applied[-1] -ne $true) {
-            Set-Status "Échec de l'application de $($currentLayout.Name) (code $([DisplayApi]::LastResult))." "Error"
+            Set-Status "Échec de l'application de $($config.Name) (code $([DisplayApi]::LastResult))." "Error"
         } Else {
-            $text = "Configuration $($currentLayout.Name) appliquée"
+            $text = "Configuration $($config.Name) appliquée"
             If ($resolutionChanged -gt 0) { $text += " ($resolutionChanged écran(s) passé(s) en résolution maximale)" }
 
             $notes = @()
@@ -2190,119 +1886,12 @@ Function Set-LayoutFromGui {
 
     Update-DisplayInfo
     Update-Preview
-    Build-Cards
-}
-
-# ========== FONCTION POUR IDENTIFIER LES ÉCRANS ==========
-$script:IdentifyWindows = @()
-$script:IdentifyTimer = $null
-$script:IdentifySeconds = 4
-
-Function Close-IdentifyOverlays {
-    param([string]$Message)
-
-    If ($script:IdentifyTimer) {
-        $script:IdentifyTimer.Stop()
-        $script:IdentifyTimer = $null
-    }
-    ForEach ($w In $script:IdentifyWindows) { $w.Close() }
-    $script:IdentifyWindows = @()
-    If ($Message) { Set-Status $Message "Success" }
-}
-
-Function Show-IdentifyOverlays {
-    Close-IdentifyOverlays
-
-    # Numérotation identique à l'aperçu : écran N = source N-1 de [DisplayApi]::GetSources()
-    Update-DisplayInfo
-    Update-Preview
-    If ($script:Displays.Count -eq 0) {
-        Set-Status "Aucun écran détecté." "Error"
-        return
-    }
-
-    if (-not ([System.Management.Automation.PSTypeName]'System.Windows.Forms.Screen').Type) {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-    }
-    $formsScreens = @([System.Windows.Forms.Screen]::AllScreens)
-
-    For ($i = 0; $i -lt $script:Displays.Count; $i++) {
-        $d = $script:Displays[$i]
-
-        # Rectangle de l'écran dans le repère du processus (tient compte de la mise à l'échelle Windows)
-        $fs = $formsScreens | Where-Object { $_.DeviceName -eq $d.GdiDeviceName } | Select-Object -First 1
-        If ($fs) {
-            $bx = $fs.Bounds.X; $by = $fs.Bounds.Y; $bw = $fs.Bounds.Width; $bh = $fs.Bounds.Height
-        } Else {
-            $bx = $d.X; $by = $d.Y; $bw = $d.Width; $bh = $d.Height
-        }
-
-        $ovl = [System.Windows.Window]::new()
-        $ovl.WindowStyle = [System.Windows.WindowStyle]::None
-        $ovl.AllowsTransparency = $true
-        $ovl.Background = [System.Windows.Media.Brushes]::Transparent
-        $ovl.Topmost = $true
-        $ovl.ShowInTaskbar = $false
-        $ovl.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
-
-        # Grand numéro en bas à gauche de l'écran, comme le bouton Identifier de Windows
-        $number = New-TextBlock -Text ($i + 1).ToString() -Color "#FFFFFF" -Size ([Math]::Max([Math]::Min($bh / 6, 140), 64)) -Weight "SemiBold" -Font "Segoe UI Variable Display, Segoe UI"
-        $number.HorizontalAlignment = "Left"
-        $number.TextAlignment = "Left"
-
-        $name = New-TextBlock -Text (Get-DisplayLabel -Index $i) -Color "#E6E6E6" -Size 16
-        $name.HorizontalAlignment = "Left"
-        $name.TextAlignment = "Left"
-
-        $panel = [System.Windows.Controls.StackPanel]::new()
-        $panel.Children.Add($number) | Out-Null
-        $panel.Children.Add($name) | Out-Null
-
-        $border = [System.Windows.Controls.Border]::new()
-        $border.Background = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromArgb(230, 32, 32, 32))
-        $border.BorderBrush = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromArgb(40, 255, 255, 255))
-        $border.BorderThickness = [System.Windows.Thickness]::new(1)
-        $border.CornerRadius = [System.Windows.CornerRadius]::new(8)
-        $border.Padding = [System.Windows.Thickness]::new(32, 8, 40, 24)
-        $border.Margin = [System.Windows.Thickness]::new(48)
-        $border.HorizontalAlignment = "Left"
-        $border.VerticalAlignment = "Bottom"
-        $border.Cursor = [System.Windows.Input.Cursors]::Hand
-        $border.Child = $panel
-
-        $ovl.Content = $border
-
-        # Fermer au clic
-        $ovl.Add_MouseLeftButtonDown({
-            Close-IdentifyOverlays -Message "Identification terminée"
-        })
-
-        # Placement en pixels sur l'écran visé, puis plein écran sur ce même écran
-        $hwnd = [System.Windows.Interop.WindowInteropHelper]::new($ovl).EnsureHandle()
-        [DisplayApi]::MoveWindow($hwnd, $bx, $by, $bw, $bh) | Out-Null
-        $ovl.Show()
-        $ovl.WindowState = [System.Windows.WindowState]::Maximized
-
-        $script:IdentifyWindows += $ovl
-    }
-
-    # Fermer après quelques secondes si non cliqué
-    $script:IdentifyTimer = [System.Windows.Threading.DispatcherTimer]::new()
-    $script:IdentifyTimer.Interval = [System.TimeSpan]::FromSeconds($script:IdentifySeconds)
-    $script:IdentifyTimer.Add_Tick({
-        Close-IdentifyOverlays -Message "Identification terminée (timeout)"
-    })
-    $script:IdentifyTimer.Start()
-
-    Set-Status "Cliquez sur un numéro ou attendez $($script:IdentifySeconds) secondes..." "Info"
 }
 
 # ========== ÉVÉNEMENTS ==========
 $window.Icon = New-GlyphImage -Glyph ([string][char]0xE7F4) -Color $C.Accent
 $chkMaxRes.IsChecked = [bool]$script:UseMaxResolution
-$script:Drag = $null
-$script:PreviewSlots = @()
-$script:PreviewTiles = @{}
+$chkSwapExternal.IsChecked = [bool]$script:SwapExternal
 
 $btnApply.Add_Click({
     # Affiche l'état "en cours" avant de lancer l'application, qui bloque l'interface quelques secondes
@@ -2311,10 +1900,6 @@ $btnApply.Add_Click({
     $window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [Action]{
         Try { Set-LayoutFromGui } Finally { $btnApply.IsEnabled = $true }
     }) | Out-Null
-})
-
-$btnIdentify.Add_Click({
-    Show-IdentifyOverlays
 })
 
 $tglFavorites.Add_Click({
@@ -2326,8 +1911,11 @@ $tglFavorites.Add_Click({
 $chkMaxRes.Add_Click({
     $script:UseMaxResolution = [bool]$chkMaxRes.IsChecked
     Save-Settings
-    Update-Preview
-    Build-Cards
+})
+
+$chkSwapExternal.Add_Click({
+    $script:SwapExternal = [bool]$chkSwapExternal.IsChecked
+    Save-Settings
 })
 
 # Barre de titre assortie au thème et fond Mica sous Windows 11
@@ -2342,14 +1930,6 @@ $window.Add_SourceInitialized({
 $window.Add_ContentRendered({
     Build-Cards
     Update-Preview
-})
-
-$cvPreview.Add_SizeChanged({
-    Update-Preview
-})
-
-$window.Add_Closed({
-    Close-IdentifyOverlays
 })
 
 # ========== AFFICHER LA FENÊTRE ==========
