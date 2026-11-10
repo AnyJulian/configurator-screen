@@ -985,6 +985,11 @@ Function Get-LayoutGeometry {
             [int]$xBottom = [Math]::Floor(($top.Width - $bottom.Width) / 2.0)
             $result = @( @(0, 0), @($xBottom, [int]$top.Height) )
         }
+        "BelowRight" {
+            # Emplacements : 0 = grand écran, 1 = écran juste en dessous, aligné sur son bord droit
+            $top = $Slots[0]; $bottom = $Slots[1]
+            $result = @( @(0, 0), @([int]($top.Width - $bottom.Width), [int]$top.Height) )
+        }
         default {
             throw "Unknown layout: $LayoutKey"
         }
@@ -1154,7 +1159,8 @@ Function Invoke-ScreenConfiguration {
 # Postes de travail : les configurations sont regroupées par poste dans l'interface
 $script:Devices = @(
     @{ Key = "Dual"; Name = "Poste à deux écrans" },
-    @{ Key = "UW34"; Name = "Poste avec écran 34 pouces" }
+    @{ Key = "UW34"; Name = "Poste avec écran 34 pouces" },
+    @{ Key = "M27"; Name = "Poste avec écran 27 pouces" }
 )
 
 # Device : poste concerné ; Slots : rôles placés dans chaque emplacement de la géométrie (L = portable, M1 / M2 = écrans externes)
@@ -1203,6 +1209,13 @@ $script:Configs = @(
         PrimaryLabel = "l'écran 34 pouces, seul écran utilisé"
         Geometry = "Horizontal"; Slots = @("M1"); Primary = "M1"; MinScreens = 1; MinExternal = 1; DisplayMode = "external"
         MissingHint = "vérifiez que l'écran 34 pouces est branché"
+    },
+    @{
+        Key = "M27Open"; Name = "27″ ouvert"; Device = "M27"; Image = "27-ouvert.png"; Favorite = $false
+        Description = "Portable ouvert en bas à droite de l'écran 27 pouces"
+        PrimaryLabel = "l'écran du portable"
+        Geometry = "BelowRight"; Slots = @("M1", "L"); Primary = "L"; MinScreens = 2; MinExternal = 1
+        MissingHint = "ouvrez l'ordinateur portable et vérifiez que l'écran 27 pouces est branché"
     }
 )
 
@@ -1289,7 +1302,7 @@ Function Get-DisplayLabel {
     return "$(Get-DisplayName -Index $Index)`n$($d.Width) × $($d.Height)"
 }
 
-# Poste reconnu d'après les écrans externes branchés : deux écrans, ou un seul grand écran (34 pouces / ultra-large)
+# Poste reconnu d'après les écrans externes branchés : deux écrans, un écran 34 pouces (ultra-large) ou un écran 27 pouces
 Function Get-DetectedDevice {
     $externals = @($script:Displays | Where-Object { -not $_.IsInternal })
     If ($externals.Count -ge 2) { return "Dual" }
@@ -1298,6 +1311,7 @@ Function Get-DetectedDevice {
         $diagonal = If ($d.Edid) { $d.Edid.DiagonalInches } Else { 0 }
         $ratio = If ($d.Height -gt 0) { $d.Width / $d.Height } Else { 0 }
         If ($diagonal -ge 30 -or $ratio -ge 2.1) { return "UW34" }
+        return "M27"
     }
     return $null
 }
