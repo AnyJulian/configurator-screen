@@ -8,7 +8,7 @@ Add-Type -AssemblyName WindowsBase
 
 # ========== INTÉGRATION DE DisplayApi ==========
 $displayApiType = ([System.Management.Automation.PSTypeName]'DisplayApi').Type
-If ($displayApiType -and (-not $displayApiType.GetField('Version') -or $displayApiType.GetField('Version').GetValue($null) -lt 7)) {
+If ($displayApiType -and (-not $displayApiType.GetField('Version') -or $displayApiType.GetField('Version').GetValue($null) -lt 8)) {
     # Un type déjà compilé ne peut pas être remplacé dans la même session PowerShell
     throw "Une ancienne version de DisplayApi est déjà chargée dans cette session PowerShell. Fermez-la puis relancez le script."
 }
@@ -23,7 +23,7 @@ public struct POINTL { public int x; public int y; }
 
 public static class DisplayApi
 {
-    public const int Version = 7;
+    public const int Version = 8;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct LUID { public uint LowPart; public int HighPart; }
@@ -673,6 +673,236 @@ public static class DisplayApi
         return SetPrimaryDisplay(target);
     }
 
+    /* ------------------------------
+       ICÔNES DU BUREAU
+       Explorer range les icônes à partir du coin haut-gauche de l'ensemble du bureau, et non de l'écran principal :
+       quand l'écran principal n'est pas en haut à gauche, les icônes restent sur un autre écran.
+       Elles sont replacées via les interfaces COM officielles du shell (IShellWindows -> IShellBrowser -> IFolderView).
+       ------------------------------ */
+
+    [ComImport, Guid("85CB6900-4D95-11CF-960C-0080C7F4EE85"), InterfaceType(ComInterfaceType.InterfaceIsDual)]
+    interface IShellWindows
+    {
+        int Count { get; }
+        [return: MarshalAs(UnmanagedType.IDispatch)] object Item([MarshalAs(UnmanagedType.Struct)] object index);
+        [return: MarshalAs(UnmanagedType.IUnknown)] object _NewEnum();
+        void Register([MarshalAs(UnmanagedType.IDispatch)] object pid, int hwnd, int swClass, out int plCookie);
+        void RegisterPending(int lThreadId, [MarshalAs(UnmanagedType.Struct)] ref object pvarloc, [MarshalAs(UnmanagedType.Struct)] ref object pvarlocRoot, int swClass, out int plCookie);
+        void Revoke(int lCookie);
+        void OnNavigate(int lCookie, [MarshalAs(UnmanagedType.Struct)] ref object pvarLoc);
+        void OnActivated(int lCookie, bool fActive);
+        [return: MarshalAs(UnmanagedType.IDispatch)]
+        object FindWindowSW([MarshalAs(UnmanagedType.Struct)] ref object pvarLoc, [MarshalAs(UnmanagedType.Struct)] ref object pvarLocRoot, int swClass, out int pHWND, int swfwOptions);
+    }
+
+    [ComImport, Guid("6D5140C1-7436-11CE-8034-00AA006009FA"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IComServiceProvider
+    {
+        [PreserveSig]
+        int QueryService(ref Guid guidService, ref Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object ppvObject);
+    }
+
+    // Seules les méthodes utilisées sont appelées ; les autres réservent leur place dans la table virtuelle
+    [ComImport, Guid("000214E2-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellBrowser
+    {
+        void GetWindow(out IntPtr phwnd);
+        void ContextSensitiveHelp(bool fEnterMode);
+        void InsertMenusSB();
+        void SetMenuSB();
+        void RemoveMenusSB();
+        void SetStatusTextSB();
+        void EnableModelessSB();
+        void TranslateAcceleratorSB();
+        void BrowseObject();
+        void GetViewStateStream();
+        void GetControlWindow();
+        void SendControlMsg();
+        void QueryActiveShellView([MarshalAs(UnmanagedType.Interface)] out IShellView ppshv);
+    }
+
+    [ComImport, Guid("000214E3-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellView
+    {
+        void GetWindow(out IntPtr phwnd);
+    }
+
+    [ComImport, Guid("CDE725B0-CCC9-4519-917E-325D72FAB4CE"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IFolderView
+    {
+        void GetCurrentViewMode(out uint pViewMode);
+        void SetCurrentViewMode(uint viewMode);
+        void GetFolder(ref Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object ppv);
+        void Item(int iItemIndex, out IntPtr ppidl);
+        void ItemCount(uint uFlags, out int pcItems);
+        void Items(uint uFlags, ref Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object ppv);
+        void GetSelectionMarkedItem(out int piItem);
+        void GetFocusedItem(out int piItem);
+        void GetItemPosition(IntPtr pidl, out POINTL ppt);
+        void GetSpacing(out POINTL ppt);
+        void GetDefaultSpacing(out POINTL ppt);
+        [PreserveSig] int GetAutoArrange();
+        void SelectItem(int iItem, uint dwFlags);
+        void SelectAndPositionItems(uint cidl, [MarshalAs(UnmanagedType.LPArray)] IntPtr[] apidl,
+                                    [MarshalAs(UnmanagedType.LPArray)] POINTL[] apt, uint dwFlags);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr FindWindowEx(IntPtr parent, IntPtr childAfter, string className, string windowName);
+
+    [DllImport("user32.dll")]
+    static extern bool ClientToScreen(IntPtr hWnd, ref POINTL point);
+
+    [DllImport("user32.dll")]
+    static extern bool SystemParametersInfo(uint action, uint uiParam, ref RECT pvParam, uint winIni);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr MonitorFromPoint(POINTL pt, uint flags);
+
+    [DllImport("user32.dll")]
+    static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO info);
+
+    const int  CSIDL_DESKTOP           = 0;
+    const int  SWC_DESKTOP             = 8;
+    const int  SWFO_NEEDDISPATCH       = 1;
+    const uint SVGIO_ALLVIEW           = 2;
+    const uint SVSI_POSITIONITEM       = 0x80;
+    const uint SPI_GETWORKAREA         = 0x0030;
+    const uint MONITOR_DEFAULTTONEAREST = 2;
+
+    private static string lastIconMessage = "";
+    public static string LastIconMessage { get { return lastIconMessage; } }
+
+    static IFolderView GetDesktopFolderView(out IntPtr listView)
+    {
+        listView = IntPtr.Zero;
+        Type shellWindowsType = Type.GetTypeFromCLSID(new Guid("9BA05972-F6A8-11CF-A442-00A0C90A8F39"));
+        var shellWindows = (IShellWindows)Activator.CreateInstance(shellWindowsType);
+        object location = CSIDL_DESKTOP;
+        object root = null;
+        int hwnd;
+        object desktop = shellWindows.FindWindowSW(ref location, ref root, SWC_DESKTOP, out hwnd, SWFO_NEEDDISPATCH);
+        if (desktop == null) return null;
+
+        Guid topLevelBrowser = new Guid("4C96BE40-915C-11CF-99D3-00AA004AE837");
+        Guid browserId = typeof(IShellBrowser).GUID;
+        object browserObject;
+        if (((IComServiceProvider)desktop).QueryService(ref topLevelBrowser, ref browserId, out browserObject) != 0) return null;
+
+        IShellView view;
+        ((IShellBrowser)browserObject).QueryActiveShellView(out view);
+        IntPtr defView;
+        view.GetWindow(out defView);
+        listView = FindWindowEx(defView, IntPtr.Zero, "SysListView32", null);
+        return (IFolderView)view;
+    }
+
+    // Déplace les icônes du bureau sur l'écran principal. Renvoie le nombre d'icônes déplacées,
+    // 0 si elles y sont déjà, -1 si la réorganisation automatique est active, -2 si le bureau est introuvable, -3 en cas d'erreur
+    public static int MoveDesktopIconsToPrimary()
+    {
+        IntPtr oldContext = EnterPhysicalCoordinates();
+        var pidls = new List<IntPtr>();
+        try
+        {
+            IntPtr listView;
+            IFolderView view = GetDesktopFolderView(out listView);
+            if (view == null) { lastIconMessage = "bureau introuvable"; return -2; }
+            if (view.GetAutoArrange() == 0) { lastIconMessage = "réorganisation automatique active : Windows place lui-même les icônes"; return -1; }
+
+            int count;
+            view.ItemCount(SVGIO_ALLVIEW, out count);
+            if (count == 0) { lastIconMessage = "aucune icône sur le bureau"; return 0; }
+
+            // Repère : coordonnées de la vue -> coordonnées écran (pixels physiques)
+            POINTL origin = new POINTL();
+            if (listView != IntPtr.Zero) ClientToScreen(listView, ref origin);
+
+            RECT work = new RECT();
+            SystemParametersInfo(SPI_GETWORKAREA, 0, ref work, 0);
+            POINTL spacing;
+            view.GetSpacing(out spacing);
+            if (spacing.x <= 0 || spacing.y <= 0) { spacing.x = 75; spacing.y = 100; }
+
+            var positions = new List<POINTL>();
+            for (int i = 0; i < count; i++)
+            {
+                IntPtr pidl;
+                view.Item(i, out pidl);
+                POINTL p;
+                view.GetItemPosition(pidl, out p);
+                pidls.Add(pidl);
+                p.x += origin.x;
+                p.y += origin.y;
+                positions.Add(p);
+            }
+
+            bool allOnPrimary = true;
+            int minX = int.MaxValue, minY = int.MaxValue, maxX = int.MinValue, maxY = int.MinValue;
+            foreach (POINTL p in positions)
+            {
+                int cx = p.x + spacing.x / 2, cy = p.y + spacing.y / 2;
+                if (cx < work.Left || cx > work.Right || cy < work.Top || cy > work.Bottom) allOnPrimary = false;
+                minX = Math.Min(minX, p.x); minY = Math.Min(minY, p.y);
+                maxX = Math.Max(maxX, p.x + spacing.x); maxY = Math.Max(maxY, p.y + spacing.y);
+            }
+            if (allOnPrimary) { lastIconMessage = count + " icône(s) déjà sur l'écran principal"; return 0; }
+
+            // Le groupe d'icônes est déplacé tel quel, en gardant son décalage par rapport au coin de son écran d'origine
+            POINTL corner = new POINTL();
+            corner.x = minX; corner.y = minY;
+            MONITORINFO source = new MONITORINFO();
+            source.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+            GetMonitorInfo(MonitorFromPoint(corner, MONITOR_DEFAULTTONEAREST), ref source);
+            int offsetX = Math.Max(0, Math.Min(minX - source.rcWork.Left, spacing.x));
+            int offsetY = Math.Max(0, Math.Min(minY - source.rcWork.Top, spacing.y));
+            int dx = work.Left + offsetX - minX;
+            int dy = work.Top + offsetY - minY;
+
+            var target = new POINTL[count];
+            if (maxX + dx <= work.Right && maxY + dy <= work.Bottom)
+            {
+                for (int i = 0; i < count; i++) { target[i].x = positions[i].x + dx; target[i].y = positions[i].y + dy; }
+            }
+            else
+            {
+                // Trop d'icônes pour garder la disposition : rangement en colonnes, dans l'ordre actuel (gauche à droite, haut en bas)
+                var order = new List<int>();
+                for (int i = 0; i < count; i++) order.Add(i);
+                order.Sort((a, b) => positions[a].x != positions[b].x ? positions[a].x.CompareTo(positions[b].x) : positions[a].y.CompareTo(positions[b].y));
+                int x = work.Left + offsetX, y = work.Top + offsetY;
+                foreach (int i in order)
+                {
+                    target[i].x = x; target[i].y = y;
+                    y += spacing.y;
+                    if (y + spacing.y > work.Bottom) { y = work.Top + offsetY; x += spacing.x; }
+                }
+            }
+
+            // Retour en coordonnées de la vue
+            for (int i = 0; i < count; i++) { target[i].x -= origin.x; target[i].y -= origin.y; }
+            view.SelectAndPositionItems((uint)count, pidls.ToArray(), target, SVSI_POSITIONITEM);
+            lastIconMessage = count + " icône(s) replacée(s) sur l'écran principal";
+            return count;
+        }
+        catch (Exception ex)
+        {
+            lastIconMessage = "erreur : " + ex.Message;
+            return -3;
+        }
+        finally
+        {
+            foreach (IntPtr pidl in pidls) Marshal.FreeCoTaskMem(pidl);
+            LeavePhysicalCoordinates(oldContext);
+        }
+    }
+
     static DEVMODE NewDevMode()
     {
         DEVMODE dm = new DEVMODE();
@@ -1104,6 +1334,20 @@ Function Apply-LayoutPositions {
     }
     $isPrimary = $confirmations -ge 2
     Write-SourcesToLog -Label "État final"
+
+    # Icônes du bureau : Explorer les laisse dans le coin haut-gauche de l'ensemble du bureau, qui n'est pas
+    # forcément l'écran principal. On lui laisse le temps de prendre en compte la nouvelle disposition, puis on
+    # les replace sur l'écran principal ; une seconde vérification rattrape un éventuel replacement par Explorer.
+    $script:LastIconsMoved = 0
+    if ($isPrimary) {
+        foreach ($delay in 1000, 1500) {
+            Start-Sleep -Milliseconds $delay
+            $moved = [DisplayApi]::MoveDesktopIconsToPrimary()
+            Write-DiagnosticLog "Icônes du bureau : $([DisplayApi]::LastIconMessage)"
+            if ($moved -gt 0) { $script:LastIconsMoved = $moved }
+            if ($moved -lt 0) { break }
+        }
+    }
 
     if ($isPrimary) {
         Write-Host "Primary set to screen index $PrimaryIndex (ID $($primary.Id))." -ForegroundColor Green
@@ -2358,6 +2602,7 @@ Function Set-LayoutFromGui {
                 # Écran principal réellement retenu par Windows, pour vérification visuelle
                 $primaryNow = [DisplayApi]::GetSources() | Where-Object { $_.IsPrimary } | Select-Object -First 1
                 $primaryText = If (-not $primaryNow) { "" } ElseIf ($primaryNow.IsInternal) { " Écran principal : écran du portable." } Else { " Écran principal : $(Get-ScreenName -Screen $primaryNow)." }
+                If ($script:LastIconsMoved -gt 0) { $primaryText += " Icônes du bureau replacées dessus." }
                 Set-Status "$text.$primaryText" "Success"
             }
         }
