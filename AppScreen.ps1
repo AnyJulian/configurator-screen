@@ -8,7 +8,7 @@ Add-Type -AssemblyName WindowsBase
 
 # ========== INTÉGRATION DE DisplayApi ==========
 $displayApiType = ([System.Management.Automation.PSTypeName]'DisplayApi').Type
-If ($displayApiType -and (-not $displayApiType.GetField('Version') -or $displayApiType.GetField('Version').GetValue($null) -lt 5)) {
+If ($displayApiType -and (-not $displayApiType.GetField('Version') -or $displayApiType.GetField('Version').GetValue($null) -lt 6)) {
     # Un type déjà compilé ne peut pas être remplacé dans la même session PowerShell
     throw "Une ancienne version de DisplayApi est déjà chargée dans cette session PowerShell. Fermez-la puis relancez le script."
 }
@@ -23,7 +23,7 @@ public struct POINTL { public int x; public int y; }
 
 public static class DisplayApi
 {
-    public const int Version = 5;
+    public const int Version = 6;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct LUID { public uint LowPart; public int HighPart; }
@@ -222,6 +222,9 @@ public static class DisplayApi
     [DllImport("user32.dll")]
     static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
+    [DllImport("user32.dll")]
+    static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+
     const uint QDC_ONLY_ACTIVE_PATHS              = 0x00000002;
     const uint SDC_APPLY                          = 0x00000080;
     const uint SDC_USE_SUPPLIED_DISPLAY_CONFIG    = 0x00000020;
@@ -243,6 +246,7 @@ public static class DisplayApi
     const int CDS_NORESET           = 0x10000000;
     const int CDS_SET_PRIMARY       = 0x00000010;
     const int DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001;
+    const int DISPLAY_DEVICE_PRIMARY_DEVICE      = 0x00000004;
 
     const uint SWP_NOZORDER   = 0x0004;
     const uint SWP_NOACTIVATE = 0x0010;
@@ -271,8 +275,8 @@ public static class DisplayApi
         // Type de connexion (DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY)
         public uint OutputTechnology;
 
-        // Windows place toujours l'écran principal à l'origine du bureau
-        public bool IsPrimary { get { return X == 0 && Y == 0; } }
+        // Écran principal selon Windows (indicateur GDI) ; à défaut de nom GDI, celui placé à l'origine du bureau
+        public bool IsPrimary;
 
         // Dalle d'ordinateur portable : connexion interne, LVDS ou DisplayPort / UDI intégré
         public bool IsInternal {
@@ -398,6 +402,9 @@ public static class DisplayApi
                 info.Adapter = modes[i].adapterId;
                 info.Key = MakeKey(modes[i].adapterId, modes[i].id);
                 FillMonitorInfo(info, paths, pathCount);
+                info.IsPrimary = string.IsNullOrEmpty(info.GdiDeviceName)
+                    ? (info.X == 0 && info.Y == 0)
+                    : IsPrimaryDisplay(info.GdiDeviceName);
                 list.Add(info);
             }
         }
@@ -457,10 +464,31 @@ public static class DisplayApi
         return ApplyCore(null, positions);
     }
 
-    public static bool TrySetPrimaryByPosition(int x, int y)
+    // Passe le thread en mode "DPI par écran" : les API GDI d'affichage renvoient alors des coordonnées physiques,
+    // sans la virtualisation appliquée quand les écrans n'ont pas la même mise à l'échelle (ex. portable 150 %, écran 100 %)
+    static IntPtr EnterPhysicalCoordinates()
     {
-        var devices = new List<string>();
-        string target = null;
+        try
+        {
+            IntPtr old = SetThreadDpiAwarenessContext(new IntPtr(-4));            // PER_MONITOR_AWARE_V2
+            if (old == IntPtr.Zero) old = SetThreadDpiAwarenessContext(new IntPtr(-3)); // PER_MONITOR_AWARE
+            return old;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return IntPtr.Zero;
+        }
+    }
+
+    static void LeavePhysicalCoordinates(IntPtr oldContext)
+    {
+        if (oldContext == IntPtr.Zero) return;
+        try { SetThreadDpiAwarenessContext(oldContext); } catch (EntryPointNotFoundException) { }
+    }
+
+    // Écrans GDI rattachés au bureau (\\.\DISPLAYn) avec leur mode courant
+    static void GetAttachedDisplays(List<string> names, List<DEVMODE> modes)
+    {
         for (int devNum = 0; ; devNum++)
         {
             DISPLAY_DEVICE dd = new DISPLAY_DEVICE();
@@ -471,34 +499,93 @@ public static class DisplayApi
             bool isDisplay = dd.DeviceName != null && dd.DeviceName.StartsWith(@"\\.\DISPLAY", StringComparison.OrdinalIgnoreCase);
             if (!isDisplay || (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) == 0) continue;
 
-            DEVMODE dm = new DEVMODE();
-            dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+            DEVMODE dm = NewDevMode();
             if (!EnumDisplaySettingsEx(dd.DeviceName, ENUM_CURRENT_SETTINGS, ref dm, 0)) continue;
 
-            devices.Add(dd.DeviceName);
-            if (dm.dmPosition.x == x && dm.dmPosition.y == y)
-                target = dd.DeviceName;
+            names.Add(dd.DeviceName);
+            modes.Add(dm);
+        }
+    }
+
+    // Écran principal tel que Windows le considère réellement (indicateur GDI)
+    public static bool IsPrimaryDisplay(string gdiDeviceName)
+    {
+        if (string.IsNullOrEmpty(gdiDeviceName)) return false;
+        for (int devNum = 0; ; devNum++)
+        {
+            DISPLAY_DEVICE dd = new DISPLAY_DEVICE();
+            dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+            if (!EnumDisplayDevices(null, devNum, ref dd, 0)) return false;
+            if (string.Equals(dd.DeviceName, gdiDeviceName, StringComparison.OrdinalIgnoreCase))
+                return (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
+        }
+    }
+
+    // Fait de l'écran \\.\DISPLAYn l'écran principal en gardant la disposition : il passe en (0,0), les autres sont décalés d'autant
+    public static bool SetPrimaryDisplay(string gdiDeviceName)
+    {
+        if (IsPrimaryDisplay(gdiDeviceName)) { lastResult = 0; return true; }
+
+        IntPtr oldContext = EnterPhysicalCoordinates();
+        try
+        {
+            var names = new List<string>();
+            var modes = new List<DEVMODE>();
+            GetAttachedDisplays(names, modes);
+
+            int target = names.FindIndex(n => string.Equals(n, gdiDeviceName, StringComparison.OrdinalIgnoreCase));
+            if (target < 0) { lastResult = -3; return false; }
+
+            int dx = modes[target].dmPosition.x;
+            int dy = modes[target].dmPosition.y;
+
+            // Le futur écran principal d'abord, puis les autres
+            var order = new List<int>();
+            order.Add(target);
+            for (int i = 0; i < names.Count; i++) if (i != target) order.Add(i);
+
+            foreach (int i in order)
+            {
+                DEVMODE dm = modes[i];
+                dm.dmPosition.x -= dx;
+                dm.dmPosition.y -= dy;
+                dm.dmFields = DM_POSITION;
+
+                uint flags = (uint)(CDS_UPDATEREGISTRY | CDS_NORESET);
+                if (i == target) flags |= (uint)CDS_SET_PRIMARY;
+                int r1 = ChangeDisplaySettingsEx(names[i], ref dm, IntPtr.Zero, flags, IntPtr.Zero);
+                if (r1 != 0) { lastResult = r1; return false; }
+            }
+            int r2 = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+            lastResult = r2;
+            return (r2 == 0) && IsPrimaryDisplay(gdiDeviceName);
+        }
+        finally
+        {
+            LeavePhysicalCoordinates(oldContext);
+        }
+    }
+
+    public static bool TrySetPrimaryByPosition(int x, int y)
+    {
+        IntPtr oldContext = EnterPhysicalCoordinates();
+        string target = null;
+        try
+        {
+            var names = new List<string>();
+            var modes = new List<DEVMODE>();
+            GetAttachedDisplays(names, modes);
+            for (int i = 0; i < names.Count; i++)
+            {
+                if (modes[i].dmPosition.x == x && modes[i].dmPosition.y == y) { target = names[i]; break; }
+            }
+        }
+        finally
+        {
+            LeavePhysicalCoordinates(oldContext);
         }
         if (target == null) { lastResult = -3; return false; }
-
-        // L'écran principal doit être en (0,0) : tous les écrans sont décalés de (-x, -y)
-        foreach (string name in devices)
-        {
-            DEVMODE dm = new DEVMODE();
-            dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
-            if (!EnumDisplaySettingsEx(name, ENUM_CURRENT_SETTINGS, ref dm, 0)) continue;
-            dm.dmPosition.x -= x;
-            dm.dmPosition.y -= y;
-            dm.dmFields = DM_POSITION;
-
-            uint flags = (uint)(CDS_UPDATEREGISTRY | CDS_NORESET);
-            if (name == target) flags |= (uint)CDS_SET_PRIMARY;
-            int r1 = ChangeDisplaySettingsEx(name, ref dm, IntPtr.Zero, flags, IntPtr.Zero);
-            if (r1 != 0) { lastResult = r1; return false; }
-        }
-        int r2 = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
-        lastResult = r2;
-        return (r2 == 0);
+        return SetPrimaryDisplay(target);
     }
 
     static DEVMODE NewDevMode()
@@ -836,13 +923,25 @@ Function Apply-LayoutPositions {
     }
     Write-Host "$LayoutName layout applied." -ForegroundColor Green
 
+    # Windows ne fait pas toujours de l'écran placé en (0,0) l'écran principal (notamment quand il n'est pas
+    # en haut à gauche de la disposition) : on vérifie l'écran principal réel et on le corrige par son nom GDI
     $primary = $Sources[$PrimaryIndex]
     $current = [DisplayApi]::GetSources() | Where-Object { $_.Key -eq $primary.Key } | Select-Object -First 1
-    if ($current -and -not $current.IsPrimary -and -not [DisplayApi]::TrySetPrimaryByPosition($current.X, $current.Y)) {
+    if (-not $current) {
+        $isPrimary = $false
+    } elseif ($current.IsPrimary) {
+        $isPrimary = $true
+    } elseif ($current.GdiDeviceName) {
+        $isPrimary = [DisplayApi]::SetPrimaryDisplay($current.GdiDeviceName)
+    } else {
+        $isPrimary = [DisplayApi]::TrySetPrimaryByPosition($current.X, $current.Y)
+    }
+
+    if ($isPrimary) {
+        Write-Host "Primary set to screen index $PrimaryIndex (ID $($primary.Id))." -ForegroundColor Green
+    } else {
         $script:LastLayoutWarning = "Could not set primary display (code $([DisplayApi]::LastResult))."
         Write-Warning $script:LastLayoutWarning
-    } else {
-        Write-Host "Primary set to screen index $PrimaryIndex (ID $($primary.Id))." -ForegroundColor Green
     }
 
     return $true
