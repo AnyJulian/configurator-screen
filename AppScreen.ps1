@@ -872,6 +872,57 @@ public static class DisplayApi
 "@
 }
 
+# ========== JOURNAL DE DIAGNOSTIC ==========
+# Réécrit à chaque application : écrans vus, rôles attribués, codes de retour de Windows
+$script:DiagnosticPath = Join-Path $env:APPDATA "ScreenConfig\diagnostic.log"
+
+Function Start-DiagnosticLog {
+    param([string]$Title)
+    Try {
+        $dir = Split-Path -Parent $script:DiagnosticPath
+        If (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        [System.IO.File]::WriteAllText($script:DiagnosticPath, "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Title`r`n", [System.Text.Encoding]::UTF8)
+    } Catch { }
+}
+
+Function Write-DiagnosticLog {
+    param([string]$Message)
+    Try {
+        [System.IO.File]::AppendAllText($script:DiagnosticPath, "$(Get-Date -Format 'HH:mm:ss.fff') $Message`r`n", [System.Text.Encoding]::UTF8)
+    } Catch { }
+}
+
+Function Format-SourceForLog {
+    param($Source)
+    $name = if ($Source.FriendlyName) { $Source.FriendlyName } elseif ($Source.PnpId) { $Source.PnpId } else { "?" }
+    return "{0} {1} [{2}] interne={3} tech=0x{4:X} pos={5},{6} taille={7}x{8} principal={9}" -f `
+        $Source.GdiDeviceName, $name, $Source.Key, $Source.IsInternal, $Source.OutputTechnology,
+        $Source.X, $Source.Y, $Source.Width, $Source.Height, $Source.IsPrimary
+}
+
+Function Write-SourcesToLog {
+    param([string]$Label)
+    $list = [DisplayApi]::GetSources()
+    Write-DiagnosticLog "$Label :"
+    foreach ($s in @(if ($list) { $list })) { Write-DiagnosticLog "  $(Format-SourceForLog -Source $s)" }
+}
+
+# Le mode d'affichage demandé est-il déjà en place ? (évite de relancer DisplaySwitch inutilement)
+Function Test-DisplayModeReady {
+    param([string]$Mode, [int]$MinScreens)
+
+    $list = [DisplayApi]::GetSources()
+    $sources = @(if ($list) { $list })
+    if ($sources.Count -lt $MinScreens) { return $false }
+    if ($Mode -eq 'external') { return (@($sources | Where-Object { $_.IsInternal }).Count -eq 0) }
+
+    # Étendu : chaque moniteur branché est allumé et a sa propre source (pas de duplication d'écran)
+    $connected = [DisplayApi]::GetConnectedMonitors()
+    $monitors = @(if ($connected) { $connected })
+    $active = @($monitors | Where-Object { $_.IsActive }).Count
+    return ($monitors.Count -gt 0 -and $active -eq $monitors.Count -and $sources.Count -eq $monitors.Count)
+}
+
 Function Wait-ExtendedDesktop {
     param(
         [int]$TimeoutSeconds = 10,
@@ -880,14 +931,29 @@ Function Wait-ExtendedDesktop {
         [ValidateSet('extend', 'external')]
         [string]$Mode = 'extend'
     )
-    DisplaySwitch.exe "/$Mode"
+
+    # DisplaySwitch applique le mode en arrière-plan et peut réappliquer l'ancienne disposition enregistrée :
+    # il n'est lancé que si nécessaire, et on attend qu'il ait terminé avant de placer les écrans
+    if (Test-DisplayModeReady -Mode $Mode -MinScreens $MinScreens) {
+        Write-DiagnosticLog "Mode $Mode déjà actif : DisplaySwitch non lancé"
+    } else {
+        Write-DiagnosticLog "Lancement de DisplaySwitch /$Mode"
+        $process = Start-Process -FilePath "DisplaySwitch.exe" -ArgumentList "/$Mode" -PassThru -WindowStyle Hidden
+        if (-not $process.WaitForExit(5000)) { Write-DiagnosticLog "DisplaySwitch toujours actif après 5 s" }
+    }
+
+    # Attente d'un affichage prêt et stable (deux relevés identiques consécutifs)
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $previous = $null
     do {
         Start-Sleep -Milliseconds 500
         $sources = [DisplayApi]::GetSources()
         $ready = $sources -and $sources.Count -ge $MinScreens -and
                  ($Mode -ne 'external' -or @($sources | Where-Object { $_.IsInternal }).Count -eq 0)
-    } while (-not $ready -and (Get-Date) -lt $deadline)
+        $signature = if ($sources) { (@($sources | ForEach-Object { "$($_.Key)@$($_.X),$($_.Y),$($_.Width)x$($_.Height)" }) -join ';') } else { "" }
+        $stable = $ready -and $signature -eq $previous
+        $previous = $signature
+    } while (-not $stable -and (Get-Date) -lt $deadline)
     if (-not $ready) {
         throw "Extended desktop not ready after ${TimeoutSeconds}s. Found $( if ($sources) { $sources.Count } else { 0 } ) source(s)."
     }
@@ -1001,26 +1067,43 @@ Function Apply-LayoutPositions {
     $script:LastLayoutWarning = $null
 
     $final = Complete-LayoutPositions -Positions $Positions -Sources $Sources -PrimaryIndex $PrimaryIndex
+    foreach ($key in $final.Keys) { Write-DiagnosticLog "Position demandée [$key] = $($final[$key].x),$($final[$key].y)" }
     $ok = [DisplayApi]::ApplyPositionsByKey($final)
+    Write-DiagnosticLog "SetDisplayConfig : code $([DisplayApi]::LastResult)"
     if (-not $ok) {
         Write-Warning "SetDisplayConfig returned code: $([DisplayApi]::LastResult)"
         return $false
     }
     Write-Host "$LayoutName layout applied." -ForegroundColor Green
+    Write-SourcesToLog -Label "Après placement"
 
-    # Windows ne fait pas toujours de l'écran placé en (0,0) l'écran principal (notamment quand il n'est pas
-    # en haut à gauche de la disposition) : on vérifie l'écran principal réel et on le corrige par son nom GDI
+    # Windows ne fait pas toujours de l'écran placé en (0,0) l'écran principal, et peut réappliquer une ancienne
+    # disposition juste après : l'écran principal réel est vérifié plusieurs fois et corrigé par son nom GDI
+    # jusqu'à être confirmé deux fois de suite
     $primary = $Sources[$PrimaryIndex]
-    $current = [DisplayApi]::GetSources() | Where-Object { $_.Key -eq $primary.Key } | Select-Object -First 1
-    if (-not $current) {
-        $isPrimary = $false
-    } elseif ($current.IsPrimary) {
-        $isPrimary = $true
-    } elseif ($current.GdiDeviceName) {
-        $isPrimary = [DisplayApi]::SetPrimaryDisplay($current.GdiDeviceName)
-    } else {
-        $isPrimary = [DisplayApi]::TrySetPrimaryByPosition($current.X, $current.Y)
+    Write-DiagnosticLog "Écran principal voulu : $($primary.GdiDeviceName) [$($primary.Key)]"
+    $confirmations = 0
+    for ($attempt = 0; $attempt -lt 8 -and $confirmations -lt 2; $attempt++) {
+        if ($attempt -gt 0) { Start-Sleep -Milliseconds 500 }
+        $current = [DisplayApi]::GetSources() | Where-Object { $_.Key -eq $primary.Key } | Select-Object -First 1
+        if (-not $current) {
+            Write-DiagnosticLog "Écran principal voulu introuvable"
+            break
+        }
+        if ($current.IsPrimary) {
+            $confirmations++
+            continue
+        }
+        $confirmations = 0
+        if ($current.GdiDeviceName) {
+            $set = [DisplayApi]::SetPrimaryDisplay($current.GdiDeviceName)
+        } else {
+            $set = [DisplayApi]::TrySetPrimaryByPosition($current.X, $current.Y)
+        }
+        Write-DiagnosticLog "Correction de l'écran principal ($($current.GdiDeviceName)) : $set, code $([DisplayApi]::LastResult)"
     }
+    $isPrimary = $confirmations -ge 2
+    Write-SourcesToLog -Label "État final"
 
     if ($isPrimary) {
         Write-Host "Primary set to screen index $PrimaryIndex (ID $($primary.Id))." -ForegroundColor Green
@@ -1203,13 +1286,18 @@ Function Invoke-ScreenConfiguration {
         [switch]$SwapExternal
     )
 
+    Start-DiagnosticLog -Title "Configuration $($Config.Name) (résolution max : $([bool]$MaxResolution), inversion : $([bool]$SwapExternal))"
+    Write-SourcesToLog -Label "État initial"
+
     $mode = if ($Config.DisplayMode) { $Config.DisplayMode } else { 'extend' }
     try {
         $sources = @(Wait-ExtendedDesktop -MinScreens $Config.MinScreens -Mode $mode)
     } catch {
+        Write-DiagnosticLog "Écrans attendus introuvables : $($_.Exception.Message)"
         throw "La configuration $($Config.Name) n'a pas trouvé les écrans attendus : $($Config.MissingHint)."
     }
     if ($MaxResolution) { $sources = @(Set-MaxResolution -MinScreens $Config.MinScreens) }
+    Write-SourcesToLog -Label "Écrans utilisés"
 
     # Portable fermé : seuls les deux écrans externes sont actifs
     $plan = $Config
@@ -1221,6 +1309,10 @@ Function Invoke-ScreenConfiguration {
     }
 
     $roles = Get-ScreenRoles -Sources $sources -WithLaptop $withLaptop -SwapExternal ([bool]$SwapExternal)
+    foreach ($role in "L", "M1", "M2") {
+        $label = if ($roles[$role]) { "$($roles[$role].GdiDeviceName) [$($roles[$role].Key)]" } else { "-" }
+        Write-DiagnosticLog "Rôle $role (L = portable, M = externe) : $label"
+    }
     $slots = New-Object object[] $plan.Slots.Count
     for ($i = 0; $i -lt $plan.Slots.Count; $i++) {
         $slots[$i] = $roles[$plan.Slots[$i]]
@@ -1381,16 +1473,21 @@ Function Get-ConnectedScreens {
     return $script:Displays
 }
 
+Function Get-ScreenName {
+    param($Screen)
+
+    $name = $Screen.FriendlyName
+    If (-not $name -and $Screen.Edid -and $Screen.Edid.Model -ne "Unknown") { $name = $Screen.Edid.Model }
+    If (-not $name -and $Screen.PnpId) { $name = $Screen.PnpId }
+    If (-not $name) { $name = "Écran" }
+    return $name
+}
+
 Function Get-DisplayName {
     param([int]$Index)
 
     If ($Index -lt 0 -or $Index -ge $script:Displays.Count) { return "Non détecté" }
-    $d = $script:Displays[$Index]
-    $name = $d.FriendlyName
-    If (-not $name -and $d.Edid -and $d.Edid.Model -ne "Unknown") { $name = $d.Edid.Model }
-    If (-not $name -and $d.PnpId) { $name = $d.PnpId }
-    If (-not $name) { $name = "Écran" }
-    return $name
+    return Get-ScreenName -Screen $script:Displays[$Index]
 }
 
 # Nom + résolution de l'écran d'index $Index
@@ -2194,7 +2291,14 @@ Function Update-Preview {
         $txtDetect.Text = "$count écran(s) branché(s) : $($parts -join ' + ')."
         If ($inactive -gt 0) { $txtDetect.Text += " $inactive éteint(s) pour le moment." }
     }
-    $txtDetect.ToolTip = (@(For ($i = 0; $i -lt $script:Displays.Count; $i++) { "$($i + 1). $((Get-DisplayLabel -Index $i) -replace "`n", ' · ')" }) -join "`n")
+    $txtDetect.ToolTip = (@(For ($i = 0; $i -lt $script:Displays.Count; $i++) {
+        $d = $script:Displays[$i]
+        $roles = @()
+        If ($d.IsInternal) { $roles += "portable" }
+        If ($d.IsPrimary) { $roles += "principal actuel" }
+        $suffix = If ($roles.Count -gt 0) { " ($($roles -join ', '))" } Else { "" }
+        "$($i + 1). $((Get-DisplayLabel -Index $i) -replace "`n", ' · ')$suffix"
+    }) -join "`n")
 }
 
 # Suivi des écrans en temps réel : relit l'état des écrans et ne met l'interface à jour que s'il a changé.
@@ -2245,13 +2349,16 @@ Function Set-LayoutFromGui {
             If ($resolutionChanged -gt 0) { $text += " ($resolutionChanged écran(s) passé(s) en résolution maximale)" }
 
             $notes = @()
-            If ($script:LastLayoutWarning) { $notes += "l'écran principal n'a pas pu être défini" }
+            If ($script:LastLayoutWarning) { $notes += "l'écran principal n'a pas pu être défini (détails : $script:DiagnosticPath)" }
             If ($resolutionFailed -gt 0) { $notes += "résolution maximale refusée sur $resolutionFailed écran(s)" }
 
             If ($notes.Count -gt 0) {
                 Set-Status "$text, mais $($notes -join ' et ')." "Warning"
             } Else {
-                Set-Status "$text." "Success"
+                # Écran principal réellement retenu par Windows, pour vérification visuelle
+                $primaryNow = [DisplayApi]::GetSources() | Where-Object { $_.IsPrimary } | Select-Object -First 1
+                $primaryText = If (-not $primaryNow) { "" } ElseIf ($primaryNow.IsInternal) { " Écran principal : écran du portable." } Else { " Écran principal : $(Get-ScreenName -Screen $primaryNow)." }
+                Set-Status "$text.$primaryText" "Success"
             }
         }
     }
