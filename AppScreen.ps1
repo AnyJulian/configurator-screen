@@ -8,7 +8,7 @@ Add-Type -AssemblyName WindowsBase
 
 # ========== INTÉGRATION DE DisplayApi ==========
 $displayApiType = ([System.Management.Automation.PSTypeName]'DisplayApi').Type
-If ($displayApiType -and -not $displayApiType.GetField('Version')) {
+If ($displayApiType -and (-not $displayApiType.GetField('Version') -or $displayApiType.GetField('Version').GetValue($null) -lt 3)) {
     # Un type déjà compilé ne peut pas être remplacé dans la même session PowerShell
     throw "Une ancienne version de DisplayApi est déjà chargée dans cette session PowerShell. Fermez-la puis relancez le script."
 }
@@ -23,7 +23,7 @@ public struct POINTL { public int x; public int y; }
 
 public static class DisplayApi
 {
-    public const int Version = 2;
+    public const int Version = 3;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct LUID { public uint LowPart; public int HighPart; }
@@ -128,6 +128,14 @@ public static class DisplayApi
         public string monitorDevicePath;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DISPLAYCONFIG_TARGET_PREFERRED_MODE {
+        public DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+        public uint width;
+        public uint height;
+        public DISPLAYCONFIG_TARGET_MODE targetMode;
+    }
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
     public struct DEVMODE
     {
@@ -196,6 +204,9 @@ public static class DisplayApi
     [DllImport("user32.dll")]
     static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_TARGET_DEVICE_NAME requestPacket);
 
+    [DllImport("user32.dll")]
+    static extern int DisplayConfigGetDeviceInfo(ref DISPLAYCONFIG_TARGET_PREFERRED_MODE requestPacket);
+
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     static extern bool EnumDisplaySettingsEx(string lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode, int dwFlags);
 
@@ -219,9 +230,15 @@ public static class DisplayApi
     const uint DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE = 1;
     const uint DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1;
     const uint DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME = 2;
+    const uint DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE = 3;
 
     const int ENUM_CURRENT_SETTINGS = -1;
     const int DM_POSITION           = 0x00000020;
+    const int DM_BITSPERPEL         = 0x00040000;
+    const int DM_PELSWIDTH          = 0x00080000;
+    const int DM_PELSHEIGHT         = 0x00100000;
+    const int DM_DISPLAYFREQUENCY   = 0x00400000;
+    const int DM_INTERLACED         = 0x00000002;
     const int CDS_UPDATEREGISTRY    = 0x00000001;
     const int CDS_NORESET           = 0x10000000;
     const int CDS_SET_PRIMARY       = 0x00000010;
@@ -249,9 +266,22 @@ public static class DisplayApi
         public string DevicePath = "";
         public string PnpId = "";
         public EdidInfo Edid;
+        // Résolution native du moniteur (celle "recommandée" par Windows), 0 si inconnue
+        public int PreferredWidth, PreferredHeight;
 
         // Windows place toujours l'écran principal à l'origine du bureau
         public bool IsPrimary { get { return X == 0 && Y == 0; } }
+    }
+
+    public class ResolutionChange {
+        public string GdiDeviceName = "";
+        public uint SourceId;
+        public int OldWidth, OldHeight, OldFrequency;
+        public int NewWidth, NewHeight, NewFrequency;
+        public bool NeedsChange;
+        public bool Changed;
+        public int Result;
+        public DEVMODE Mode;
     }
 
     public class EdidInfo
@@ -297,6 +327,17 @@ public static class DisplayApi
 
                 var ti = paths[p].targetInfo;
                 info.TargetId = ti.id;
+
+                var pref = new DISPLAYCONFIG_TARGET_PREFERRED_MODE();
+                pref.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_PREFERRED_MODE;
+                pref.header.size = (uint)Marshal.SizeOf(typeof(DISPLAYCONFIG_TARGET_PREFERRED_MODE));
+                pref.header.adapterId = ti.adapterId;
+                pref.header.id = ti.id;
+                if (DisplayConfigGetDeviceInfo(ref pref) == 0)
+                {
+                    info.PreferredWidth = (int)pref.width;
+                    info.PreferredHeight = (int)pref.height;
+                }
 
                 var tgt = new DISPLAYCONFIG_TARGET_DEVICE_NAME();
                 tgt.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
@@ -452,6 +493,106 @@ public static class DisplayApi
         return (r2 == 0);
     }
 
+    static DEVMODE NewDevMode()
+    {
+        DEVMODE dm = new DEVMODE();
+        dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+        return dm;
+    }
+
+    static bool IsBetterMode(DEVMODE dm, DEVMODE best, int currentFrequency)
+    {
+        long area = (long)dm.dmPelsWidth * dm.dmPelsHeight;
+        long bestArea = (long)best.dmPelsWidth * best.dmPelsHeight;
+        if (area != bestArea) return area > bestArea;
+        if (dm.dmPelsWidth != best.dmPelsWidth) return dm.dmPelsWidth > best.dmPelsWidth;
+        // Même résolution : garder la fréquence actuelle si elle existe, sinon la plus haute
+        bool keeps = dm.dmDisplayFrequency == currentFrequency;
+        bool bestKeeps = best.dmDisplayFrequency == currentFrequency;
+        if (keeps != bestKeeps) return keeps;
+        return dm.dmDisplayFrequency > best.dmDisplayFrequency;
+    }
+
+    // Calcule, sans rien modifier, la résolution maximale de chaque écran actif (plafonnée à sa résolution native)
+    public static List<ResolutionChange> GetMaxResolutionPlan()
+    {
+        var sources = GetSources();
+        if (sources == null) return null;
+
+        var plan = new List<ResolutionChange>();
+        foreach (var src in sources)
+        {
+            if (string.IsNullOrEmpty(src.GdiDeviceName)) continue;
+            DEVMODE cur = NewDevMode();
+            if (!EnumDisplaySettingsEx(src.GdiDeviceName, ENUM_CURRENT_SETTINGS, ref cur, 0)) continue;
+
+            // Résolution native exprimée dans l'orientation actuelle (portrait = 90° ou 270°)
+            int capW = src.PreferredWidth, capH = src.PreferredHeight;
+            if (cur.dmDisplayOrientation == 1 || cur.dmDisplayOrientation == 3) { int t = capW; capW = capH; capH = t; }
+
+            // Sans EDS_ROTATEDMODE, seuls les modes de l'orientation actuelle sont listés
+            DEVMODE best = cur;
+            bool found = false;
+            for (int i = 0; ; i++)
+            {
+                DEVMODE dm = NewDevMode();
+                if (!EnumDisplaySettingsEx(src.GdiDeviceName, i, ref dm, 0)) break;
+                if (dm.dmBitsPerPel != cur.dmBitsPerPel) continue;
+                if ((dm.dmDisplayFlags & DM_INTERLACED) != 0) continue;
+                if (capW > 0 && capH > 0 && (dm.dmPelsWidth > capW || dm.dmPelsHeight > capH)) continue;
+                if (!found || IsBetterMode(dm, best, cur.dmDisplayFrequency)) { best = dm; found = true; }
+            }
+            if (!found) continue;
+
+            var change = new ResolutionChange();
+            change.GdiDeviceName = src.GdiDeviceName;
+            change.SourceId = src.Id;
+            change.OldWidth = cur.dmPelsWidth;
+            change.OldHeight = cur.dmPelsHeight;
+            change.OldFrequency = cur.dmDisplayFrequency;
+            change.NewWidth = best.dmPelsWidth;
+            change.NewHeight = best.dmPelsHeight;
+            change.NewFrequency = best.dmDisplayFrequency;
+            change.NeedsChange = best.dmPelsWidth != cur.dmPelsWidth
+                              || best.dmPelsHeight != cur.dmPelsHeight
+                              || best.dmDisplayFrequency != cur.dmDisplayFrequency;
+            change.Mode = best;
+            plan.Add(change);
+        }
+        return plan;
+    }
+
+    // Passe chaque écran actif à sa résolution maximale ; les écrans déjà au maximum ne sont pas touchés
+    public static List<ResolutionChange> SetMaxResolutions()
+    {
+        var plan = GetMaxResolutionPlan();
+        if (plan == null) { lastResult = -1; return null; }
+
+        bool pending = false;
+        foreach (var change in plan)
+        {
+            if (!change.NeedsChange) continue;
+            DEVMODE dm = change.Mode;
+            dm.dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+            change.Result = ChangeDisplaySettingsEx(change.GdiDeviceName, ref dm, IntPtr.Zero, (uint)(CDS_UPDATEREGISTRY | CDS_NORESET), IntPtr.Zero);
+            if (change.Result == 0) { change.Changed = true; pending = true; }
+        }
+
+        lastResult = 0;
+        if (pending)
+        {
+            lastResult = ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+            if (lastResult != 0)
+            {
+                foreach (var change in plan)
+                {
+                    if (change.Changed) { change.Changed = false; change.Result = lastResult; }
+                }
+            }
+        }
+        return plan;
+    }
+
     // Positionne une fenêtre en coordonnées écran du processus (même repère que System.Windows.Forms.Screen)
     public static bool MoveWindow(IntPtr hwnd, int x, int y, int width, int height)
     {
@@ -529,6 +670,30 @@ Function Wait-ExtendedDesktop {
     } while ((-not $sources -or $sources.Count -lt $MinScreens) -and (Get-Date) -lt $deadline)
     if (-not $sources -or $sources.Count -lt $MinScreens) {
         throw "Extended desktop not ready after ${TimeoutSeconds}s. Found $( if ($sources) { $sources.Count } else { 0 } ) source(s)."
+    }
+    return $sources
+}
+
+# Passe chaque écran à sa résolution maximale (plafonnée à la résolution native), puis relit les sources
+Function Set-MaxResolution {
+    param([int]$MinScreens = 1)
+
+    $script:LastResolutionChanges = @()
+    $changes = [DisplayApi]::SetMaxResolutions()
+    if ($null -eq $changes) { throw "Could not read display modes." }
+    $script:LastResolutionChanges = @($changes)
+
+    foreach ($c in $changes) {
+        if ($c.Changed) {
+            Write-Host "$($c.GdiDeviceName): $($c.OldWidth)x$($c.OldHeight)@$($c.OldFrequency)Hz -> $($c.NewWidth)x$($c.NewHeight)@$($c.NewFrequency)Hz" -ForegroundColor Green
+        } elseif ($c.NeedsChange) {
+            Write-Warning "$($c.GdiDeviceName): could not set $($c.NewWidth)x$($c.NewHeight)@$($c.NewFrequency)Hz (code $($c.Result))."
+        }
+    }
+
+    $sources = [DisplayApi]::GetSources()
+    if (-not $sources -or $sources.Count -lt $MinScreens) {
+        throw "Only $( if ($sources) { $sources.Count } else { 0 } ) screen(s) found after resolution change."
     }
     return $sources
 }
@@ -638,11 +803,13 @@ Function Apply-LayoutPositions {
 Function Set-LayoutTShape {
     param(
         [int]$PrimaryIndex = 0,
-        [int[]]$SourceMap = @(1, 2, 0)
+        [int[]]$SourceMap = @(1, 2, 0),
+        [switch]$MaxResolution
     )
 
     $sources = Wait-ExtendedDesktop -MinScreens 3
     if ($sources.Count -lt 3) { throw "Need at least 3 screens, found $($sources.Count)." }
+    if ($MaxResolution) { $sources = Set-MaxResolution -MinScreens 3 }
 
     # Emplacements : 0 = haut gauche, 1 = haut droite, 2 = bas centré
     $slots = Resolve-SlotSources -Sources $sources -SourceMap $SourceMap -SlotCount 3
@@ -664,11 +831,13 @@ Function Set-LayoutHorizontal {
     param(
         [int]$MinScreens = 3,
         [int]$PrimaryIndex = 2,
-        [int[]]$SourceMap = @()
+        [int[]]$SourceMap = @(),
+        [switch]$MaxResolution
     )
 
     $sources = Wait-ExtendedDesktop -MinScreens $MinScreens
     if ($sources.Count -lt $MinScreens) { throw "Need at least $MinScreens screens, found $($sources.Count)." }
+    if ($MaxResolution) { $sources = Set-MaxResolution -MinScreens $MinScreens }
 
     # Ordre de gauche à droite : écrans du SourceMap, puis les autres dans l'ordre des Id
     $ordered = @()
@@ -693,11 +862,13 @@ Function Set-LayoutHorizontal {
 Function Set-LayoutLineOut {
     param(
         [int]$PrimaryIndex = 0,
-        [int[]]$SourceMap = @(0, 1, 2)
+        [int[]]$SourceMap = @(0, 1, 2),
+        [switch]$MaxResolution
     )
 
     $sources = Wait-ExtendedDesktop -MinScreens 3
     if ($sources.Count -lt 3) { throw "Need at least 3 screens, found $($sources.Count)." }
+    if ($MaxResolution) { $sources = Set-MaxResolution -MinScreens 3 }
 
     # Emplacements : 0 = gauche, 1 = centre, 2 = petit écran à droite aligné en bas
     $slots = Resolve-SlotSources -Sources $sources -SourceMap $SourceMap -SlotCount 3
@@ -822,6 +993,7 @@ for ($i = 0; $i -lt $script:Layouts.Count; $i++) {
 $script:ShowFavoritesOnly = $false
 $script:SelectedSwapIndex = -1
 $script:LastLayoutWarning = $null
+$script:LastResolutionChanges = @()
 
 # ========== ÉCRANS CONNECTÉS ==========
 $script:Displays = @()
@@ -1268,17 +1440,19 @@ Function Set-LayoutFromGui {
     # Récupérer l'index dans SourceMap pour l'écran principal
     $primarySourceIdx = $currentLayout.SourceMap[$primaryScreenIdx]
     $sourceMap = [int[]]$currentLayout.SourceMap
+    $script:LastResolutionChanges = @()
 
     Try {
+        # Chaque écran passe d'abord à sa résolution maximale, la disposition est calculée avec ces tailles
         switch ($currentLayout.LayoutKey) {
             "T" {
-                $result = Set-LayoutTShape -PrimaryIndex $primarySourceIdx -SourceMap $sourceMap
+                $result = Set-LayoutTShape -PrimaryIndex $primarySourceIdx -SourceMap $sourceMap -MaxResolution
             }
             "Horizontal" {
-                $result = Set-LayoutHorizontal -MinScreens 3 -PrimaryIndex $primarySourceIdx -SourceMap $sourceMap
+                $result = Set-LayoutHorizontal -MinScreens 3 -PrimaryIndex $primarySourceIdx -SourceMap $sourceMap -MaxResolution
             }
             "LineOut" {
-                $result = Set-LayoutLineOut -PrimaryIndex $primarySourceIdx -SourceMap $sourceMap
+                $result = Set-LayoutLineOut -PrimaryIndex $primarySourceIdx -SourceMap $sourceMap -MaxResolution
             }
             default {
                 throw "Layout non supporté : $($currentLayout.LayoutKey)"
@@ -1286,12 +1460,24 @@ Function Set-LayoutFromGui {
         }
 
         $applied = @($result)
+        $resolutionChanged = @($script:LastResolutionChanges | Where-Object { $_.Changed }).Count
+        $resolutionFailed  = @($script:LastResolutionChanges | Where-Object { $_.NeedsChange -and -not $_.Changed }).Count
+
         If ($applied.Count -eq 0 -or $applied[-1] -ne $true) {
             Set-Status "Échec de l'application de $($currentLayout.Name) (code $([DisplayApi]::LastResult))." "#E63946"
-        } ElseIf ($script:LastLayoutWarning) {
-            Set-Status "Configuration $($currentLayout.Name) appliquée, mais l'écran principal n'a pas pu être défini." "#FFA500"
         } Else {
-            Set-Status "Configuration $($currentLayout.Name) appliquée." "#4CAF50"
+            $text = "Configuration $($currentLayout.Name) appliquée"
+            If ($resolutionChanged -gt 0) { $text += " ($resolutionChanged écran(s) passé(s) en résolution maximale)" }
+
+            $notes = @()
+            If ($script:LastLayoutWarning) { $notes += "l'écran principal n'a pas pu être défini" }
+            If ($resolutionFailed -gt 0) { $notes += "résolution maximale refusée sur $resolutionFailed écran(s)" }
+
+            If ($notes.Count -gt 0) {
+                Set-Status "$text, mais $($notes -join ' et ')." "#FFA500"
+            } Else {
+                Set-Status "$text." "#4CAF50"
+            }
         }
     }
     Catch {
