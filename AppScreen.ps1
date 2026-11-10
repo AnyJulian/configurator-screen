@@ -8,7 +8,7 @@ Add-Type -AssemblyName WindowsBase
 
 # ========== INTÉGRATION DE DisplayApi ==========
 $displayApiType = ([System.Management.Automation.PSTypeName]'DisplayApi').Type
-If ($displayApiType -and (-not $displayApiType.GetField('Version') -or $displayApiType.GetField('Version').GetValue($null) -lt 8)) {
+If ($displayApiType -and (-not $displayApiType.GetField('Version') -or $displayApiType.GetField('Version').GetValue($null) -lt 9)) {
     # Un type déjà compilé ne peut pas être remplacé dans la même session PowerShell
     throw "Une ancienne version de DisplayApi est déjà chargée dans cette session PowerShell. Fermez-la puis relancez le script."
 }
@@ -23,7 +23,7 @@ public struct POINTL { public int x; public int y; }
 
 public static class DisplayApi
 {
-    public const int Version = 8;
+    public const int Version = 9;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct LUID { public uint LowPart; public int HighPart; }
@@ -224,6 +224,25 @@ public static class DisplayApi
 
     [DllImport("user32.dll")]
     static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
+
+    [DllImport("shell32.dll")]
+    static extern int GetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] out string appId);
+
+    // Identité propre dans la barre des tâches : la fenêtre n'est plus regroupée avec powershell.exe
+    // et Windows affiche son icône à elle. À appeler avant d'ouvrir la fenêtre.
+    public static bool SetAppId(string appId)
+    {
+        return SetCurrentProcessExplicitAppUserModelID(appId) == 0;
+    }
+
+    public static string GetAppId()
+    {
+        string appId;
+        return GetCurrentProcessExplicitAppUserModelID(out appId) == 0 ? appId : null;
+    }
 
     const uint QDC_ALL_PATHS                      = 0x00000001;
     const uint QDC_ONLY_ACTIVE_PATHS              = 0x00000002;
@@ -1101,6 +1120,9 @@ public static class DisplayApi
 }
 "@
 }
+
+# Identité propre dans la barre des tâches (icône de l'app au lieu du logo PowerShell)
+Try { [void][DisplayApi]::SetAppId("ScreenConfig.ConfigurationEcrans") } Catch { }
 
 # ========== JOURNAL DE DIAGNOSTIC ==========
 # Réécrit à chaque application : écrans vus, rôles attribués, codes de retour de Windows
