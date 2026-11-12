@@ -1189,8 +1189,11 @@ Function Wait-ExtendedDesktop {
     if (Test-DisplayModeReady -Mode $Mode -MinScreens $MinScreens) {
         Write-DiagnosticLog "Mode $Mode déjà actif : DisplaySwitch non lancé"
     } else {
-        Write-DiagnosticLog "Lancement de DisplaySwitch /$Mode"
-        $process = Start-Process -FilePath "DisplaySwitch.exe" -ArgumentList "/$Mode" -PassThru -WindowStyle Hidden
+        # Arguments chiffrés : les options /extend et /external ne fonctionnent pas sur toutes les versions de Windows
+        # (3 = Étendre, 4 = Deuxième écran uniquement)
+        $switchArgument = if ($Mode -eq 'external') { "4" } else { "3" }
+        Write-DiagnosticLog "Lancement de DisplaySwitch.exe $switchArgument ($Mode)"
+        $process = Start-Process -FilePath "DisplaySwitch.exe" -ArgumentList $switchArgument -PassThru -WindowStyle Hidden
         if (-not $process.WaitForExit(5000)) { Write-DiagnosticLog "DisplaySwitch toujours actif après 5 s" }
     }
 
