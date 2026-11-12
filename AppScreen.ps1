@@ -2162,51 +2162,58 @@ Function New-Brush {
                 <TextBlock Text="Choisissez la configuration qui correspond à votre bureau, puis cliquez sur Appliquer."
                            Foreground="$($C.TextSecondary)" Margin="0,4,0,0" TextWrapping="Wrap"/>
 
-                <!-- Disposition actuellement en place -->
-                <TextBlock Style="{StaticResource SectionTitle}" Text="Configuration actuelle"/>
-                <Border Style="{StaticResource Card}">
+                <!-- Aperçu avant / après : disposition en place à gauche, configuration choisie à droite -->
+                <TextBlock Style="{StaticResource SectionTitle}" Text="Aperçu"/>
+                <Border Style="{StaticResource Card}" Padding="16,14,16,14">
                     <Grid>
                         <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="340"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="*"/>
                         </Grid.ColumnDefinitions>
-                        <Border Background="$($C.PreviewBg)" CornerRadius="5,0,0,5" Height="150">
-                            <Canvas x:Name="cvCurrent" ClipToBounds="True"/>
-                        </Border>
-                        <Grid Grid.Column="1" Margin="20,12,16,12" VerticalAlignment="Center">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto"/>
-                                <ColumnDefinition Width="*"/>
-                            </Grid.ColumnDefinitions>
-                            <TextBlock x:Name="txtCurrentIcon" Style="{StaticResource Icon}" FontSize="20" Margin="0,0,14,0" VerticalAlignment="Top"/>
-                            <StackPanel Grid.Column="1">
-                                <TextBlock x:Name="txtCurrentTitle" FontSize="16" FontWeight="SemiBold" TextWrapping="Wrap"/>
-                                <TextBlock x:Name="txtCurrentDetails" FontSize="12" Foreground="$($C.TextSecondary)" TextWrapping="Wrap" Margin="0,4,0,0"/>
-                            </StackPanel>
-                        </Grid>
-                    </Grid>
-                </Border>
 
-                <!-- Configuration sélectionnée -->
-                <TextBlock x:Name="txtPreviewTitle" Style="{StaticResource SectionTitle}" Text="Aperçu"/>
-                <Border Style="{StaticResource Card}">
-                    <Grid>
-                        <Grid.RowDefinitions>
-                            <RowDefinition Height="270"/>
-                            <RowDefinition Height="Auto"/>
-                        </Grid.RowDefinitions>
-                        <Border x:Name="bdPreview" Background="$($C.Illustration)" CornerRadius="5,5,0,0" Padding="32,24"/>
-                        <Grid Grid.Row="1" Margin="16,12,16,12">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto"/>
-                                <ColumnDefinition Width="*"/>
-                            </Grid.ColumnDefinitions>
-                            <TextBlock x:Name="txtPreviewIcon" Style="{StaticResource Icon}" Text="&#xE80F;" FontSize="20" Margin="4,0,16,0"/>
-                            <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                                <TextBlock x:Name="txtPrimaryInfo" TextWrapping="Wrap"/>
-                                <TextBlock x:Name="txtDetect" FontSize="12" Foreground="$($C.TextSecondary)" TextWrapping="Wrap"/>
-                            </StackPanel>
-                        </Grid>
+                        <!-- Actuellement -->
+                        <StackPanel Grid.Column="0">
+                            <TextBlock Text="Actuellement" FontSize="12" Foreground="$($C.TextSecondary)" Margin="2,0,0,6"/>
+                            <Border Background="$($C.PreviewBg)" CornerRadius="6" Height="190">
+                                <Canvas x:Name="cvCurrent" ClipToBounds="True"/>
+                            </Border>
+                            <Grid Margin="2,10,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock x:Name="txtCurrentIcon" Style="{StaticResource Icon}" Margin="0,0,10,0" VerticalAlignment="Top"/>
+                                <StackPanel Grid.Column="1">
+                                    <TextBlock x:Name="txtCurrentTitle" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                                    <TextBlock x:Name="txtCurrentDetails" FontSize="12" Foreground="$($C.TextSecondary)" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                                </StackPanel>
+                            </Grid>
+                        </StackPanel>
+
+                        <!-- Passage de l'un à l'autre : flèche, ou coche si la configuration choisie est déjà en place -->
+                        <Border x:Name="bdTransition" Grid.Column="1" Width="36" Height="36" CornerRadius="18" Margin="14,105,14,0"
+                                VerticalAlignment="Top" Background="$($C.ControlFill)" BorderBrush="$($C.ControlStroke)" BorderThickness="1">
+                            <TextBlock x:Name="txtTransition" Style="{StaticResource Icon}" Text="&#xE72A;" FontSize="14" HorizontalAlignment="Center"/>
+                        </Border>
+
+                        <!-- Après application -->
+                        <StackPanel Grid.Column="2">
+                            <TextBlock x:Name="txtPreviewTitle" Text="Après application" FontSize="12" Foreground="$($C.TextSecondary)" Margin="2,0,0,6"
+                                       TextTrimming="CharacterEllipsis"/>
+                            <Border x:Name="bdPreview" Background="$($C.Illustration)" CornerRadius="6" Height="190" Padding="16,12"/>
+                            <Grid Margin="2,10,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock x:Name="txtPreviewIcon" Style="{StaticResource Icon}" Text="&#xE80F;" Margin="0,0,10,0" VerticalAlignment="Top"/>
+                                <StackPanel Grid.Column="1">
+                                    <TextBlock x:Name="txtPrimaryInfo" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                                    <TextBlock x:Name="txtDetect" FontSize="12" Foreground="$($C.TextSecondary)" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                                </StackPanel>
+                            </Grid>
+                        </StackPanel>
                     </Grid>
                 </Border>
 
@@ -2298,6 +2305,8 @@ $txtStatus       = $window.FindName("txtStatus")
 $txtStatusIcon   = $window.FindName("txtStatusIcon")
 $bdStatus        = $window.FindName("bdStatus")
 $txtPreviewTitle = $window.FindName("txtPreviewTitle")
+$bdTransition    = $window.FindName("bdTransition")
+$txtTransition   = $window.FindName("txtTransition")
 $txtPreviewIcon  = $window.FindName("txtPreviewIcon")
 $txtPrimaryInfo  = $window.FindName("txtPrimaryInfo")
 $txtDetect       = $window.FindName("txtDetect")
@@ -2643,7 +2652,20 @@ Function Build-Cards {
 # Grande image de la configuration choisie, écran principal et écrans branchés
 Function Update-Preview {
     $config = $script:Configs[$script:SelectedLayoutIndex]
-    $txtPreviewTitle.Text = "Aperçu : $($config.Name)"
+    # Passage de la disposition actuelle à la configuration choisie : flèche, ou coche si elle est déjà en place
+    If ($script:SelectedLayoutIndex -eq $script:CurrentConfigIndex) {
+        $txtPreviewTitle.Text = "Déjà en place : $($config.Name)"
+        $txtTransition.Text = [string][char]0xE73E
+        $txtTransition.Foreground = New-Brush $C.SuccessFg
+        $bdTransition.Background = New-Brush $C.SuccessBg
+        $bdTransition.ToolTip = "Cette configuration est déjà en place"
+    } Else {
+        $txtPreviewTitle.Text = "Après application : $($config.Name)"
+        $txtTransition.Text = [string][char]0xE72A
+        $txtTransition.Foreground = New-Brush $C.Text
+        $bdTransition.Background = New-Brush $C.ControlFill
+        $bdTransition.ToolTip = "Cliquez sur Appliquer pour passer à cette configuration"
+    }
     $bdPreview.Child = New-ConfigVisual -Config $config -Large $true
     $txtPrimaryInfo.Text = "Écran principal : $($config.PrimaryLabel)"
 
