@@ -1,26 +1,14 @@
-2026-11-10 15:43:42 Configuration T ouvert (résolution max : True, inversion : True)
-15:43:42.640 État initial :
-15:43:42.655   \\.\DISPLAY1 LGD06F1 [0000000000013CAF:0] interne=True tech=0x80000000 pos=0,0 taille=1920x1080 principal=True
-15:43:42.655   \\.\DISPLAY2 HP E24m G4 [0000000000013CAF:1] interne=False tech=0xA pos=960,-1080 taille=1920x1080 principal=False
-15:43:42.657   \\.\DISPLAY3 HP E24mv G4 [0000000000013CAF:2] interne=False tech=0xA pos=-960,-1080 taille=1920x1080 principal=False
-15:43:42.727 Mode extend déjà actif : DisplaySwitch non lancé
-15:43:43.815 Écrans utilisés :
-15:43:43.831   \\.\DISPLAY1 LGD06F1 [0000000000013CAF:0] interne=True tech=0x80000000 pos=0,0 taille=1920x1080 principal=True
-15:43:43.833   \\.\DISPLAY2 HP E24m G4 [0000000000013CAF:1] interne=False tech=0xA pos=960,-1080 taille=1920x1080 principal=False
-15:43:43.833   \\.\DISPLAY3 HP E24mv G4 [0000000000013CAF:2] interne=False tech=0xA pos=-960,-1080 taille=1920x1080 principal=False
-15:43:43.879 Rôle L (L = portable, M = externe) : \\.\DISPLAY1 [0000000000013CAF:0]
-15:43:43.879 Rôle M1 (L = portable, M = externe) : \\.\DISPLAY3 [0000000000013CAF:2]
-15:43:43.879 Rôle M2 (L = portable, M = externe) : \\.\DISPLAY2 [0000000000013CAF:1]
-15:43:44.001 Position demandée [0000000000013CAF:2] = -960,-1080
-15:43:44.001 Position demandée [0000000000013CAF:1] = 960,-1080
-15:43:44.001 Position demandée [0000000000013CAF:0] = 0,0
-15:43:45.108 SetDisplayConfig : code 0
-15:43:45.147 Après placement :
-15:43:45.147   \\.\DISPLAY1 LGD06F1 [0000000000013CAF:0] interne=True tech=0x80000000 pos=0,0 taille=1920x1080 principal=True
-15:43:45.147   \\.\DISPLAY2 HP E24m G4 [0000000000013CAF:1] interne=False tech=0xA pos=960,-1080 taille=1920x1080 principal=False
-15:43:45.156   \\.\DISPLAY3 HP E24mv G4 [0000000000013CAF:2] interne=False tech=0xA pos=-960,-1080 taille=1920x1080 principal=False
-15:43:45.156 Écran principal voulu : \\.\DISPLAY1 [0000000000013CAF:0]
-15:43:45.802 État final :
-15:43:45.802   \\.\DISPLAY1 LGD06F1 [0000000000013CAF:0] interne=True tech=0x80000000 pos=0,0 taille=1920x1080 principal=True
-15:43:45.802   \\.\DISPLAY2 HP E24m G4 [0000000000013CAF:1] interne=False tech=0xA pos=960,-1080 taille=1920x1080 principal=False
-15:43:45.802   \\.\DISPLAY3 HP E24mv G4 [0000000000013CAF:2] interne=False tech=0xA pos=-960,-1080 taille=1920x1080 principal=False
+'\\DSV0000002.ap.cdc.fr\DFS_USERS$\Jgiraud\Profile\Desktop\Dev\Appscreen V3'
+CMD.EXE a été démarré avec le chemin d’accès comme répertoire en
+cours. Les chemins d’accès UNC ne sont pas prise en charge. Utilisation
+du répertoire Windows par défaut.
+﻿# : Le terme �#» n'est pas reconnu comme nom d'applet de commande, fonction, fichier de script
+ou programme exécutable. Vérifiez l'orthographe du nom, ou si un chemin d'accès existe, vérifiez
+que le chemin d'accès est correct et réessayez.
+Au caractère \\DSV0000002.ap.cdc.fr\DFS_USERS$\JGIRAUD\PROFILE\Desktop\Dev\Appscreen
+V3\AppScreen.ps1:1 : 1
++ ﻿# ScreenConfig-Final.ps1
++ ~~
+    + CategoryInfo          : ObjectNotFound: (﻿#:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+
