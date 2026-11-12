@@ -1185,16 +1185,17 @@ Function Wait-ExtendedDesktop {
     )
 
     # DisplaySwitch applique le mode en arrière-plan et peut réappliquer l'ancienne disposition enregistrée :
-    # il n'est lancé que si nécessaire, et on attend qu'il ait terminé avant de placer les écrans
+    # il n'est lancé que si nécessaire, puis on attend un affichage stable avant de placer les écrans (boucle ci-dessous)
     if (Test-DisplayModeReady -Mode $Mode -MinScreens $MinScreens) {
         Write-DiagnosticLog "Mode $Mode déjà actif : DisplaySwitch non lancé"
+    } elseif ($Mode -eq 'external') {
+        # 4 = Deuxième écran uniquement
+        Write-DiagnosticLog "Lancement : DisplaySwitch.exe 4"
+        DisplaySwitch.exe 4
     } else {
-        # Arguments chiffrés : les options /extend et /external ne fonctionnent pas sur toutes les versions de Windows
-        # (3 = Étendre, 4 = Deuxième écran uniquement)
-        $switchArgument = if ($Mode -eq 'external') { "4" } else { "3" }
-        Write-DiagnosticLog "Lancement de DisplaySwitch.exe $switchArgument ($Mode)"
-        $process = Start-Process -FilePath "DisplaySwitch.exe" -ArgumentList $switchArgument -PassThru -WindowStyle Hidden
-        if (-not $process.WaitForExit(5000)) { Write-DiagnosticLog "DisplaySwitch toujours actif après 5 s" }
+        # 3 = Étendre
+        Write-DiagnosticLog "Lancement : DisplaySwitch.exe 3"
+        DisplaySwitch.exe 3
     }
 
     # Attente d'un affichage prêt et stable (deux relevés identiques consécutifs)
